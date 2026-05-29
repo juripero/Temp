@@ -1,0 +1,9 @@
+sudo rm -f *.ko
+export CONFIG_NFSD_PNFS=y
+export CONFIG_NFSD_FLEXFILELAYOUT=y
+make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+sudo rm ./nfsd.ko.zst
+sudo zstd ./nfsd.ko
+sudo rm /lib/modules/$(uname -r)/kernel/fs/nfsd/nfsd.ko.zst
+sudo cp ./nfsd.ko.zst /lib/modules/$(uname -r)/kernel/fs/nfsd/
+
