@@ -1,0 +1,5 @@
+export PYTHONPATH=$VIRTUAL_ENV/lib/python3.14/site-packages/_rocm_sdk_core/share/amd_smi
+export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+
+export LIBRARY_PATH=/usr/lib/gcc/x86_64-linux-gnu/15
+export CPLUS_INCLUDE_PATH=/usr/include/c++/15/:/usr/include/x86_64-linux-gnu/c++/15
