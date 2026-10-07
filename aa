@@ -1,0 +1,6 @@
+2026-10-05T08:39:45.246781+00:00 gooxi kernel: aper_base 0x0000094800000000, aper_size 0, mask 0,  p2p_addr 1
+2026-10-05T08:39:45.246782+00:00 gooxi kernel: aper_base 0x000018e000000000, aper_size 0, mask 0,  p2p_addr 0
+2026-10-05T08:39:45.246796+00:00 gooxi kernel: aper_base 0x0000094800000000, aper_size 0, mask 0,  p2p_addr 1
+2026-10-05T08:39:45.246796+00:00 gooxi kernel: aper_base 0x000020b000000000, aper_size 0, mask 0,  p2p_addr 0
+2026-10-05T08:39:45.246797+00:00 gooxi kernel: aper_base 0x0000094800000000, aper_size 0, mask 0,  p2p_addr 1
+2026-10-05T08:39:45.246797+00:00 gooxi kernel: aper_base 0x0000111800000000, aper_size 0, mask 0,  p2p_addr 0
