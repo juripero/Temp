@@ -125,5 +125,78 @@ Fusing activation into W13 would require a separate kernel design that brings co
 
 My recommendation: add W13/W2 shapes to an explicit allowlist, benchmark each at M=1–64, and dispatch to R4D only in the winning ranges. Keep the original GEMM path for prefill batches above 64 and for configurations where it is faster.
 
+Take a look at https://github.com/GGZ14/vllm-mxfp4/blob/main/MOE-GFX1201.md, If I want to apply some of the optimization to deepseek 4.1 flash 1017, what would be your recommendation
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Worked for 31s
+
+
+
+
+
+
+
+I would start with the AITER W4A16 expert path and padded-row routing. Add W4A8 prefill only after implementing DeepSeek’s clipped SwiGLU correctly. The repository offers useful components, but its Qwen patches are not a drop-in DeepSeek configuration.
+
+The key mismatch is that DeepSeek-V4.1-Flash-1017 specifies FP4 experts, UE8M0 scales, swiglu_limit=10, 384 experts, and top-6 routing. Its routing uses sqrtsoftplus, normalization, and a routed scaling factor of 1.5. Those semantics must survive any kernel replacement. huggingface.co
+Priority	Optimization to adapt	Recommendation
+1	AITER Triton W4A16 grouped experts	First candidate for replacing your UnfusedOAITritonExperts path. Preserve packed FP4 weights and fuse gate/up activation where compatible.
+2	Padded-row routing	Prevent graph-padding tokens from selecting additional experts. Especially worth measuring for small decode and speculative verification batches.
+3	W4A8 grouped experts for prefill	Promising, but requires activation/clamp support and fresh tuning for DeepSeek’s dimensions.
+Later	Speculation, graph replay, scheduling	Tune after establishing correct, fast target-model execution.
+Skip direct port	Qwen GDN, shared-expert sigmoid gate, GQA attention patches	These depend on Qwen-specific operations or attention layouts.
+
+
+1. Port the W4A16 backend integration, including its weight preparation.
+
+The useful starting point is patch_gfx12_aiter_a16w4.py. It enables gfx12 execution, uses strided weight storage, and interleaves gate/up rows together with their scales for the fused activation. It also preserves a configured clamp rather than unconditionally disabling it. GitHub
+
+For your port, I recommend:
+- Integrate through DeepSeek’s actual MXFP4 quantization/backend selection; the repository’s Quark scheme rewrite alone will not handle that.
+- Verify FP4 packing, scale interpretation, gate/up order, and expert-local indexing before tuning.
+- Check the fused activation against DeepSeek’s reference implementation. Passing limit=10 is necessary but not sufficient if the two implementations clamp different operands or at different points.
+- Keep DeepSeek’s router initially; replace the expert computation downstream of its selected IDs and routing weights.
+The document reports 370 → 57 µs at one token for a Qwen MoE layer versus TRITON_UNFUSED. That makes this worth testing, but it is not a DeepSeek speedup estimate. GitHub
+
+2. Tune for DeepSeek’s actual W13/W2 shapes.
+
+From the checkpoint dimensions, the logical, unsharded matrices are:
+Matrix	Shape per expert, [output, input]
+W13	[4608, 5120]
+W2	[5120, 2304]
+
+
+These are derived from hidden size 5120 and expert intermediate size 2304; tensor parallelism changes the local shapes. huggingface.co
+
+Benchmark W13 and W2 separately across decode, verification, and prefill sizes. Sweep N tiles, warp count, and split-K independently. My recommendation is to choose dispatch thresholds from tokens assigned per expert and local matrix dimensions, rather than copying Qwen’s token thresholds.
+
+3. The W4A8 path currently has a concrete compatibility blocker.
+
+patch_moe_w4a8.py explicitly restricts dispatch to plain SiLU without a clamp, bias, or router weighting on the input. It defaults to switching at 1,025 tokens. Therefore, the existing fast path does not directly cover DeepSeek’s clipped activation. GitHub
+
+Extend the fused W13 epilogue to reproduce DeepSeek’s activation before quantizing the intermediate for W2. Then validate activation-quantization error using real layer inputs, including outliers that trigger clipping. Keep W4A16 as the fallback for small or unsuitable batches.
+
+4. Padded-row routing is a useful independent experiment.
+
+The document’s implementation copies a valid row’s router logits into padding rows so they reuse an already selected expert set. GitHub
+
+For DeepSeek, verify that the router has no additional token-dependent selection that defeats this reuse. Test real-token outputs with graph replay on/off, and handle zero-real-token batches and distributed execution explicitly. This can reduce unnecessary expert reads without changing the real tokens’ routing.
+
+My first implementation milestone: one DeepSeek MoE layer, real checkpoint weights and captured activations, existing routing, W4A16 execution, correct clipping, and correct W13/W2 scales. Compare intermediate and final outputs against a dequantized reference and your existing backend, then measure latency with speculation disabled.
+
+If experts are offloaded to host memory, profile PCIe traffic first: improving residency may matter more than faster arithmetic. Once that baseline is sound, add padding optimization, followed by W4A8 prefill.
 
