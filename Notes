@@ -1,0 +1,129 @@
+how do i incorporate r4d into a vanilla vllm, what do I modify in vllm
+For attention alone, you need an R4D backend adapter plus backend registration. Installing r4d.so by itself does not change vLLM execution. GDN and BF16 GEMMs require separate integration points.
+
+For your Qwen3.8-27B, I would add these independently so you can benchmark each change.
+
+Component	Where to integrate
+Full attention	New attention backend module, registered with vLLM
+BF16 small-M GEMMs	vllm/model_executor/layers/utils.py → rocm_unquantized_gemm_impl()
+GDN linear attention	vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py → _forward_core()
+Optional GDN prefill fallback	vllm/third_party/flash_linear_attention/ops/chunk.py
+These paths match the integration I inspected; check them against your installed vLLM revision.
+
+1. Build a compatible R4D extension
+
+Build R4D using the ROCm toolchain and Python environment used by your vLLM workers. Pin a source revision that matches the adapter’s API.
+
+The original libr4d repository has moved development into Radiance. Mixing its newest kernels with an older Python adapter can produce incompatible entry points. First verify that every worker can import r4d and inspect r4d.kernels().
+
+2. Add the attention adapter
+
+Use radiance_r4d_attn.py as the reference. Its three important classes are:
+
+Class	Responsibility
+R4DAttentionBackend	Advertises supported dtype, geometry, cache layout, and features
+R4DAttentionMetadataBuilder	Builds request groups and allocates persistent split-KV scratch
+R4DAttentionImpl	Passes query, KV-cache, block-table, sequence-length, scale, output, and stream arguments to R4D
+The reference subclasses Triton’s backend and retains its surrounding cache infrastructure. It supports BF16 queries and a restricted attention geometry; unsupported execution cases fall back or are rejected. Scratch must remain valid through graph capture and replay. 
+
+Cache compatibility is the main engineering work. Match physical strides, page/block interpretation, KV scale semantics, and cache-write ordering—not merely tensor shapes. For a prefill-only hybrid, preserve the existing decode backend and explicitly adapt its cache metadata for R4D.
+
+3. Register it—current upstream can do this without editing the enum
+
+Current upstream registry.py supports dynamically named backends. A registration function can look like this:
+
+# Example integration code; assumes your adapter is installed.
+def register():
+    from vllm.v1.attention.backends.registry import (
+        AttentionBackendEnum,
+        register_backend,
+    )
+
+    if "R4D" not in AttentionBackendEnum.__members__:
+        register_backend(
+            "R4D",
+            "my_r4d.attention.R4DAttentionBackend",
+        )
+
+Load that function through a vllm.general_plugins entry point so registration occurs in the relevant vLLM processes. Once registered and compatible, select it with --attention-backend R4D. 
+
+Older versions differ: Radiance’s patch_r4d.py adds an R4D member directly to the registry source. Use that approach only if your version lacks dynamic registration.
+
+4. For BF16 GEMMs, modify the ROCm dispatch point
+
+The existing patch_skinny_gemm.py inserts a guarded call near the beginning of:
+
+vllm/model_executor/layers/utils.py
+    rocm_unquantized_gemm_impl(x, weight, bias)
+Your dispatch should:
+
+Require the supported GPU, BF16 operands, compatible strides, and valid K alignment.
+Select only benchmarked (M, N, K) configurations.
+Return the R4D result when supported.
+Continue into the original implementation otherwise.
+Keep this inside vLLM’s existing operation boundary, or expose it as a properly registered custom op if called from compiled code. Calling raw Python/pybind pointer operations inside a traced region can cause compilation failures.
+
+5. GDN needs a separate layer hook
+
+The reference patch calls radiance_gdn.forward_core_fused() from _forward_core(). It handles supported convolution/recurrent-attention cases and leaves the original path available when it declines.
+
+Porting this requires matching state-cache indexing, state dtype, speculative-state handling, and prefix-cache behavior. Registering the full-attention backend does not accelerate GDN automatically.
+
+My suggested first patch: attention adapter and registration only, with BF16 queries/KV and speculation disabled. Validate prefill, decode, mixed batches, and graph replay. Then add a prefill-only hybrid policy, followed by separately measured BF16 GEMM and GDN hooks.
+
+If you provide your vLLM version or commit, I can narrow this to the exact files and API signatures for that revision.
+
+How about W2/W13 projection part
+For Qwen3.8-27B BF16, W13 and W2 are dense linear projections. You incorporate R4D at the same ROCm linear-dispatch point discussed above—there is no MoE routing or expert kernel to modify.
+
+The relevant computation is:
+
+# Conceptual forward pass
+gate_up = linear(x, W13)          # R4D candidate #1
+gate, up = gate_up.chunk(2, dim=-1)
+activated = silu(gate) * up
+output = linear(activated, W2)   # R4D candidate #2
+
+The smallest integration is to intercept both GEMMs in:
+
+vllm/model_executor/layers/utils.py
+→ rocm_unquantized_gemm_impl(x, weight, bias)
+
+The existing Radiance skinny-GEMM patch demonstrates this insertion point. Its existing shape-selection table should not be assumed to cover your large W13/W2 projections.
+
+Use a dispatcher along these lines—this is integration pseudocode:
+
+def rocm_unquantized_gemm_impl(x, weight, bias=None):
+    # weight: [N, K]; flatten leading activation dimensions into M.
+    config = lookup_r4d_config(x, weight, bias)
+
+    if config is not None:
+        return r4d_linear(x, weight, config)
+
+    return original_rocm_linear_dispatch(x, weight, bias)
+
+Your r4d_linear() wrapper must allocate the output, launch gemm_bf16_nt_m64 on the current HIP stream, and restore the expected output shape. Gate it on BF16, compatible layout, 1 ≤ M ≤ 64, valid split-K alignment, and a measured configuration.
+
+Tune W13 and W2 independently
+
+For conventional TP partitioning:
+
+Projection	No TP: local weight [N,K]	TP=2: local weight [N,K]
+W13	[34816, 5120]	[17408, 5120]
+W2	[5120, 17408]	[5120, 8704]
+W13 is column-parallel: each rank computes its gate/up partition. W2 is row-parallel: each rank computes a partial output, followed by the existing reduction.
+
+Replace only the local GEMM. Leave vLLM’s weight loading, gate/up partition ordering, SiLU multiplication, and W2 all-reduce in place. Intercepting the common linear function preserves those surrounding operations.
+
+The generic gemm_bf16_nt_m64 kernel does not fuse SwiGLU. Initially, keep:
+
+R4D W13 GEMM.
+Existing SiLU-and-multiply operation.
+R4D W2 GEMM.
+Existing tensor-parallel reduction.
+Fusing activation into W13 would require a separate kernel design that brings corresponding gate/up outputs together after any split-K reduction. That is a second optimization, not something enabled merely by switching GEMMs.
+
+My recommendation: add W13/W2 shapes to an explicit allowlist, benchmark each at M=1–64, and dispatch to R4D only in the winning ranges. Keep the original GEMM path for prefill batches above 64 and for configurations where it is faster.
+
+
+
