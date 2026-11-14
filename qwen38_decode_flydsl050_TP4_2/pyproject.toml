@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen38-gfx1201-decode"
+version = "0.4.0"
+description = "Qwen3.5-compatible 27B TP1/TP2/TP4 BF16 FlyDSL 0.5.0 attention SUM and FFN source and validation tools"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+flydsl = ["flydsl==0.5.0"]
+
+[tool.setuptools.packages.find]
+include = ["specialized_decode*"]

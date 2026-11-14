@@ -1,0 +1,12 @@
+This package includes specialized_decode/runtime/_hip_ipc.py, copied unmodified
+from ROCm/FlyDSL v0.5.0, kernels/monokernel/ipc.py, commit
+226cde8d2a84bc2687c8d69587607fddf0c16f2f.
+
+Copyright (c) 2025 FlyDSL Project Contributors
+SPDX-License-Identifier: Apache-2.0
+The upstream license is reproduced in LICENSE_FLYDSL.
+Source: https://github.com/ROCm/FlyDSL/blob/v0.5.0/kernels/monokernel/ipc.py
+
+The FlyDSL WMMA and compiler interfaces follow the pinned release's examples.
+The new peer protocol and integration are experimental and require hardware
+qualification as described in README.md.
