@@ -1,0 +1,29 @@
+test_active_and_stock_layer_parity_including_residual_and_scaling (test_cpu.CpuTests.test_active_and_stock_layer_parity_including_residual_and_scaling) ... ok
+test_bound_weights_are_zero_copy_and_replacement_is_rejected (test_cpu.CpuTests.test_bound_weights_are_zero_copy_and_replacement_is_rejected) ... ok
+test_decode_decision_fails_closed_and_keeps_physical_rows (test_cpu.CpuTests.test_decode_decision_fails_closed_and_keeps_physical_rows) ... ok
+test_health_uses_scalar_and_failure_stays_sticky (test_cpu.CpuTests.test_health_uses_scalar_and_failure_stays_sticky) ... ok
+test_installer_validates_both_files_before_writing_and_is_idempotent (test_cpu.CpuTests.test_installer_validates_both_files_before_writing_and_is_idempotent) ... ok
+test_invalid_config_and_unknown_residency_are_rejected (test_cpu.CpuTests.test_invalid_config_and_unknown_residency_are_rejected) ... ok
+test_model_loop_preserves_aux_states_and_checks_stock_steps (test_cpu.CpuTests.test_model_loop_preserves_aux_states_and_checks_stock_steps) ... ok
+test_noncontiguous_and_excess_rows_are_rejected (test_cpu.CpuTests.test_noncontiguous_and_excess_rows_are_rejected) ... ok
+test_scratch_layout_returns_sizes_and_nonoverlapping_regions (test_cpu.CpuTests.test_scratch_layout_returns_sizes_and_nonoverlapping_regions) ... ok
+test_bf16_operand_and_output_maps_match_release_atom (test_flydsl_contract.FlyDslContractTests.test_bf16_operand_and_output_maps_match_release_atom) ... ok
+test_compile_arguments_are_null_placeholders_with_dynamic_scalars (test_flydsl_contract.FlyDslContractTests.test_compile_arguments_are_null_placeholders_with_dynamic_scalars) ... ok
+test_version_and_target_conflicts_are_rejected (test_flydsl_contract.TargetTests.test_version_and_target_conflicts_are_rejected) ... ok
+test_gate_up_are_sharded_separately_and_down_columns_match (test_tp.TpTests.test_gate_up_are_sharded_separately_and_down_columns_match) ... ok
+test_local_dimensions_and_invalid_tp_are_checked (test_tp.TpTests.test_local_dimensions_and_invalid_tp_are_checked) ... ok
+test_missing_or_wrong_group_and_wrong_layer_rank_are_rejected (test_tp.TpTests.test_missing_or_wrong_group_and_wrong_layer_rank_are_rejected) ... ok
+test_out_of_place_sum_is_used_and_residual_is_not_reduced (test_tp.TpTests.test_out_of_place_sum_is_used_and_residual_is_not_reduced) ... ok
+test_production_binding_is_zero_copy_and_requires_reduced_attention (test_tp.TpTests.test_production_binding_is_zero_copy_and_requires_reduced_attention) ... ok
+test_remote_failure_becomes_locally_sticky (test_tp.TpTests.test_remote_failure_becomes_locally_sticky) ... ok
+test_startup_agreement_excludes_local_rank_and_local_cache_path (test_tp.TpTests.test_startup_agreement_excludes_local_rank_and_local_cache_path) ... ok
+test_static_guard_accepts_tp2_tp4_but_rejects_context_parallel (test_tp.TpTests.test_static_guard_accepts_tp2_tp4_but_rejects_context_parallel) ... ok
+test_vllm_adapter_reduces_on_the_supplied_tp_subgroup (test_tp.TpTests.test_vllm_adapter_reduces_on_the_supplied_tp_subgroup) ... ok
+test_tp2_all_widths_sum_residual_and_faults (test_tp_simulation.TpSimulationTests.test_tp2_all_widths_sum_residual_and_faults) ... ok
+test_tp4_all_widths_sum_residual_and_faults (test_tp_simulation.TpSimulationTests.test_tp4_all_widths_sum_residual_and_faults) ... ok
+test_two_independent_tp2_groups_do_not_mix_results (test_tp_simulation.TpSimulationTests.test_two_independent_tp2_groups_do_not_mix_results) ... ok
+
+----------------------------------------------------------------------
+Ran 24 tests in 5.850s
+
+OK
