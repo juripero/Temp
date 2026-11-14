@@ -1,0 +1,53 @@
+{
+  "mode": "isa_only",
+  "results": [
+    {
+      "hidden": 32,
+      "intermediate": 64,
+      "blocks": 4,
+      "flydsl": "0.5.0",
+      "target": "gfx1201",
+      "executed_on_gpu": false,
+      "next_free_vgpr": 41,
+      "next_free_sgpr": 36,
+      "group_segment_fixed_size": 24,
+      "private_segment_fixed_size": 0,
+      "wmma_instructions_in_static_assembly": 8,
+      "status": "ISA code generation passed; ELF linking not tested",
+      "artifact": "h32_i64_b4.s",
+      "sha256": "62dfdc55d42d213ef5350663251d38fd5fe2cea1601a4bc2b7d403f5c61af2e0"
+    },
+    {
+      "hidden": 5120,
+      "intermediate": 17408,
+      "blocks": 64,
+      "flydsl": "0.5.0",
+      "target": "gfx1201",
+      "executed_on_gpu": false,
+      "next_free_vgpr": 45,
+      "next_free_sgpr": 36,
+      "group_segment_fixed_size": 24,
+      "private_segment_fixed_size": 0,
+      "wmma_instructions_in_static_assembly": 18,
+      "status": "ISA code generation passed; ELF linking not tested",
+      "artifact": "h5120_i17408_b64.s",
+      "sha256": "6ee7e0984566051f93e820d4cb73880399a7dc41ab34aee3bf6197605414e39c"
+    },
+    {
+      "hidden": 5120,
+      "intermediate": 17408,
+      "blocks": 1,
+      "flydsl": "0.5.0",
+      "target": "gfx1201",
+      "executed_on_gpu": false,
+      "next_free_vgpr": 45,
+      "next_free_sgpr": 36,
+      "group_segment_fixed_size": 24,
+      "private_segment_fixed_size": 0,
+      "wmma_instructions_in_static_assembly": 18,
+      "status": "ISA code generation passed; ELF linking not tested",
+      "artifact": "h5120_i17408_b1.s",
+      "sha256": "09c4abbaa11d04e0fee926022d0474e109eb34202f882398ba53e2a3cf626905"
+    }
+  ]
+}

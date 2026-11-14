@@ -1,0 +1,70 @@
+{
+  "python_files_compiled": 20,
+  "cpu_unittest_cases_passed": 12,
+  "cpu_torch_version": "2.15.0+cpu",
+  "flydsl_version": "0.5.0",
+  "flydsl_source_commit": "226cde8d2a84bc2687c8d69587607fddf0c16f2f",
+  "upstream_commit": "d64414d044a898c6db646dcecd122213accd1732",
+  "original_commit": "dfebe6d884eeb6912a6fca247755fc257f6097cc",
+  "integration": "Applied to temporary copies of actual pinned source; AST checks and idempotence passed",
+  "isa_generation": {
+    "mode": "isa_only",
+    "results": [
+      {
+        "hidden": 32,
+        "intermediate": 64,
+        "blocks": 4,
+        "flydsl": "0.5.0",
+        "target": "gfx1201",
+        "executed_on_gpu": false,
+        "next_free_vgpr": 41,
+        "next_free_sgpr": 36,
+        "group_segment_fixed_size": 24,
+        "private_segment_fixed_size": 0,
+        "wmma_instructions_in_static_assembly": 8,
+        "status": "ISA code generation passed; ELF linking not tested",
+        "artifact": "h32_i64_b4.s",
+        "sha256": "62dfdc55d42d213ef5350663251d38fd5fe2cea1601a4bc2b7d403f5c61af2e0"
+      },
+      {
+        "hidden": 5120,
+        "intermediate": 17408,
+        "blocks": 64,
+        "flydsl": "0.5.0",
+        "target": "gfx1201",
+        "executed_on_gpu": false,
+        "next_free_vgpr": 45,
+        "next_free_sgpr": 36,
+        "group_segment_fixed_size": 24,
+        "private_segment_fixed_size": 0,
+        "wmma_instructions_in_static_assembly": 18,
+        "status": "ISA code generation passed; ELF linking not tested",
+        "artifact": "h5120_i17408_b64.s",
+        "sha256": "6ee7e0984566051f93e820d4cb73880399a7dc41ab34aee3bf6197605414e39c"
+      },
+      {
+        "hidden": 5120,
+        "intermediate": 17408,
+        "blocks": 1,
+        "flydsl": "0.5.0",
+        "target": "gfx1201",
+        "executed_on_gpu": false,
+        "next_free_vgpr": 45,
+        "next_free_sgpr": 36,
+        "group_segment_fixed_size": 24,
+        "private_segment_fixed_size": 0,
+        "wmma_instructions_in_static_assembly": 18,
+        "status": "ISA code generation passed; ELF linking not tested",
+        "artifact": "h5120_i17408_b1.s",
+        "sha256": "09c4abbaa11d04e0fee926022d0474e109eb34202f882398ba53e2a3cf626905"
+      }
+    ]
+  },
+  "elf_linking": "Attempted small-shape full compilation; failed at lld invocation. No ld.lld/ROCm toolkit in environment. Not verified.",
+  "gpu_execution": "NOT RUN: no AMD GPU available",
+  "gpu_numerical_parity_occupancy_graphs_fault_injection": "NOT RUN; supplied validate.py requires gfx1201 qualification",
+  "performance": "No measurements or speedup claim",
+  "default_backend": "torch",
+  "persistent_backend": "flydsl",
+  "vllm_adapter_requirement": "--enforce-eager"
+}
