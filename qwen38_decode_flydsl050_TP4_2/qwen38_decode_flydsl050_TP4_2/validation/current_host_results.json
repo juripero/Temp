@@ -1,0 +1,9 @@
+{
+  "version": "0.4.2",
+  "host_unit_tests_passed": 48,
+  "syntax_compileall": "passed",
+  "undefined_names_ruff_F821_F822_F823": "passed",
+  "gpu_execution": false,
+  "rccl_execution": false,
+  "isa": "inherited unchanged GPU source"
+}

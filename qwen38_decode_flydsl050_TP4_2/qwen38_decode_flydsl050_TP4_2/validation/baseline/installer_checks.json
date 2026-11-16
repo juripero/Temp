@@ -1,0 +1,6 @@
+{
+  "fresh_install": "passed: AST, application, backups, two projection flags, idempotence",
+  "upgrade_from_v03": "passed: AST, application, backups, two projection flags, idempotence",
+  "python_source_files_compiled": 29,
+  "vllm_commit": "d64414d044a898c6db646dcecd122213accd1732"
+}

@@ -1,0 +1,20 @@
+This package includes specialized_decode/runtime/_hip_ipc.py, adapted
+from ROCm/FlyDSL v0.5.0, kernels/monokernel/ipc.py, commit
+226cde8d2a84bc2687c8d69587607fddf0c16f2f.
+
+Copyright (c) 2025 FlyDSL Project Contributors
+SPDX-License-Identifier: Apache-2.0
+The upstream license is reproduced in LICENSE_FLYDSL.
+Source: https://github.com/ROCm/FlyDSL/blob/v0.5.0/kernels/monokernel/ipc.py
+
+Local changes in version 0.4.1 add structured HIP errors, explicit device
+selection, and IPC export diagnostics. The uncached allocation flags and
+peer GPU protocol are unchanged.
+
+The FlyDSL WMMA and compiler interfaces follow the pinned release's examples.
+The new peer protocol and integration are experimental and require hardware
+qualification as described in README.md.
+
+Version 0.4.2 adds an explicit plain-hipMalloc allocator option and allocator
+agreement checks. The peer GPU protocol remains unchanged and requires
+separate qualification when using the new memory type.
