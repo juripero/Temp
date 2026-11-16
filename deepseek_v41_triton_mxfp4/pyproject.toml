@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-expert-cache"
+version = "0.2.1+gfx1201"
+description = "Expert slot cache with a gfx1201 OAI Triton MXFP4 adapter."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[project.optional-dependencies]
+test = ["numpy", "pytest"]
+
+# vLLM auto-loads this at engine startup, so no launch-flag or code change is needed:
+# installing the package is what arms the cache.
+[project.entry-points."vllm.general_plugins"]
+expert_cache = "vllm_expert_cache:install"
+
+[tool.setuptools]
+packages = ["vllm_expert_cache", "vllm_expert_cache.backends"]
+
+[tool.setuptools.package-data]
+vllm_expert_cache = ["*.so"]

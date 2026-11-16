@@ -1,0 +1,78 @@
+{
+  "target": "gfx1201",
+  "triton_version": "3.8.0",
+  "compiled": [
+    {
+      "kernel": "manage",
+      "policy": 0,
+      "slots": 3,
+      "ids": 3,
+      "id_type": "*i32",
+      "assembly": [
+        "amdgcn",
+        "hsaco",
+        "llir",
+        "source",
+        "ttgir",
+        "ttir"
+      ]
+    },
+    {
+      "kernel": "manage",
+      "policy": 1,
+      "slots": 128,
+      "ids": 8,
+      "id_type": "*i32",
+      "assembly": [
+        "amdgcn",
+        "hsaco",
+        "llir",
+        "source",
+        "ttgir",
+        "ttir"
+      ]
+    },
+    {
+      "kernel": "manage",
+      "policy": 1,
+      "slots": 5,
+      "ids": 0,
+      "id_type": "*i32",
+      "assembly": [
+        "amdgcn",
+        "hsaco",
+        "llir",
+        "source",
+        "ttgir",
+        "ttir"
+      ]
+    },
+    {
+      "kernel": "manage",
+      "policy": 0,
+      "slots": 128,
+      "ids": 8,
+      "id_type": "*i64",
+      "assembly": [
+        "amdgcn",
+        "hsaco",
+        "llir",
+        "source",
+        "ttgir",
+        "ttir"
+      ]
+    },
+    {
+      "kernel": "gather",
+      "assembly": [
+        "amdgcn",
+        "hsaco",
+        "llir",
+        "source",
+        "ttgir",
+        "ttir"
+      ]
+    }
+  ],
+  "executed_on_gpu": false
+}
