@@ -1,0 +1,25 @@
+{
+  "version": "0.4.2",
+  "host_unit_tests_passed": 48,
+  "syntax_compileall": "passed",
+  "undefined_names_ruff_F821_F822_F823": "passed",
+  "gpu_execution": false,
+  "rccl_execution": false,
+  "isa": "inherited unchanged GPU source",
+  "source_commit": "efe05e2a28d35c844d34b52f20d3aebc349f5b9c",
+  "vllm_integration_commit": "d64414d044a898c6db646dcecd122213accd1732",
+  "flydsl_version": "0.5.0",
+  "target": "gfx1201",
+  "supported_tp": [
+    1,
+    2,
+    4
+  ],
+  "gpu_hardware_available": false,
+  "vllm_enforce_eager_required": true,
+  "real_distributed": "not run in this update",
+  "current_isa_report": null,
+  "gpu_numerics_graphs_performance": "not tested",
+  "allocation_default": "uncached; hipmalloc is explicit opt-in",
+  "exact_base_patch_applies_to_reviewed_commit": "passed"
+}

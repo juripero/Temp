@@ -1,0 +1,32 @@
+{
+  "package_version": "0.4.3",
+  "reviewed_temp_commit": "aeda0e48645ec0725927791e14f529dcd2930d56",
+  "reviewed_directory": "qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2",
+  "vllm_integration_commit": "d64414d044a898c6db646dcecd122213accd1732",
+  "flydsl_version": "0.5.0",
+  "target": "gfx1201",
+  "supported_tp": [
+    1,
+    2,
+    4
+  ],
+  "host_unittest_cases_passed": 61,
+  "host_test_log": "validation/ffn_ipc_host_tests.txt",
+  "python_syntax": "passed",
+  "ruff_F821_F822_F823": "passed",
+  "isa_generation_variants": 32,
+  "isa_generation_new_ffn_variants": 16,
+  "isa_report": "validation/ffn_ipc_isa/compile_report.json",
+  "abstract_protocol": "Two independent banks over three invocation pairs, TP2/4, uint32 wrap; passed under acquire/release premise",
+  "elf_linking": "not tested",
+  "gpu_execution": "not tested: no AMD GPU available",
+  "real_distributed": "not rerun: prior Gloo attempts blocked at transport initialization",
+  "gpu_numerics_peer_ordering_graphs_faults": "not tested; validator extended",
+  "loaded_model_quality_performance": "not tested",
+  "new_option": "QWEN38_FFN_REDUCTION=ipc; default remains collective",
+  "allocator": "existing hipmalloc/uncached selection retained",
+  "vllm_enforce_eager_required": true,
+  "historical_evidence": "validation/isa, validation/baseline, validation/current_host_results.json are prior-version evidence",
+  "source_patch": "forward application to pristine reviewed commit passed; all Python files matched",
+  "python_source_count": 32
+}

@@ -1,0 +1,628 @@
+--- a/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/_hip_ipc.py
++++ b/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/_hip_ipc.py
+@@ -1,7 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # Copyright (c) 2025 FlyDSL Project Contributors
+ 
+-"""Small ctypes wrapper for HIP allocation and IPC memory operations."""
++"""HIP host allocation/IPC wrapper, adapted from FlyDSL v0.5.0.
++
++Local changes: explicit hipMalloc base allocation, structured HIP errors,
++explicit device selection, and contextual
++IPC export diagnostics. Uncached allocation and the GPU protocol are unchanged.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -16,6 +21,38 @@
+ 
+ class _HipIpcMemHandle(ctypes.Structure):
+     _fields_ = [("reserved", ctypes.c_byte * HIP_IPC_HANDLE_BYTES)]
++
++
++class HipError(RuntimeError):
++    """A failed HIP host call, retaining its operation and numeric status."""
++
++    def __init__(self, operation, code, message):
++        self.operation, self.code = operation, int(code)
++        super().__init__(f"{operation} failed: {message} (HIP status {self.code})")
++
++
++def ipc_export_diagnostic(error, *, size, device, library, allocator="uncached"):
++    """Do not change ROCr settings after runtime initialization."""
++    mode = os.environ.get("HSA_ENABLE_IPC_MODE_LEGACY", "<unset>")
++    detail = (
++        f"{error}; exporting a dedicated {allocator} HIP allocation of {size} bytes "
++        f"on device {device}, runtime={library!r}, HSA_ENABLE_IPC_MODE_LEGACY={mode}. "
++        "This failed before any peer mapping or FlyDSL attention SUM. "
++    )
++    if getattr(error, "code", None) == 1:
++        detail += (
++            "On affected gfx1201/ROCm/Linux stacks, legacy IPC export returns "
++            "hipErrorInvalidValue. Test HSA_ENABLE_IPC_MODE_LEGACY=0 in the "
++            "launch environment, then restart every worker; changing it here "
++            "is too late. Run diagnose_ipc.py --devices 0,1 --compare-modes "
++            "to distinguish runtime-mode and allocation-type failures. "
++        )
++    return detail + (
++        "The mailbox bypasses PyTorch's caching allocator; changing "
++        "expandable_segments is not a fix for this allocation. If direct IPC "
++        "is unsupported, restart with QWEN38_ATTENTION_INPUT=reduced so stock "
++        "attention SUM remains enabled."
++    )
+ 
+ 
+ class HipRuntime:
+@@ -51,6 +88,8 @@
+     def _configure(self, library) -> None:
+         if self._configured_library is library:
+             return
++        library.hipSetDevice.restype = ctypes.c_int
++        library.hipSetDevice.argtypes = [ctypes.c_int]
+         library.hipIpcGetMemHandle.restype = ctypes.c_int
+         library.hipIpcGetMemHandle.argtypes = [ctypes.POINTER(_HipIpcMemHandle), ctypes.c_void_p]
+         library.hipIpcOpenMemHandle.restype = ctypes.c_int
+@@ -61,6 +100,8 @@
+         library.hipGetErrorString.argtypes = [ctypes.c_int]
+         library.hipPointerGetAttribute.restype = ctypes.c_int
+         library.hipPointerGetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
++        library.hipMalloc.restype = ctypes.c_int
++        library.hipMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+         library.hipExtMallocWithFlags.restype = ctypes.c_int
+         library.hipExtMallocWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint]
+         library.hipFree.restype = ctypes.c_int
+@@ -79,7 +120,11 @@
+             message = value.decode("utf-8", errors="replace") if value else f"hipError({error})"
+         except Exception:
+             message = f"hipError({error})"
+-        raise RuntimeError(f"{operation} failed: {message}")
++        raise HipError(operation, error, message)
++
++    def set_device(self, device: int) -> None:
++        """Select the local visible GPU in the HIP runtime used by this wrapper."""
++        self.check(self.library().hipSetDevice(int(device)), operation="hipSetDevice")
+ 
+     def get_allocation_base(self, device_pointer: int) -> int:
+         """Return the hipMalloc allocation base containing ``device_pointer``."""
+@@ -130,28 +175,43 @@
+         error = self.library().hipIpcCloseMemHandle(ctypes.c_void_p(int(mapped_base)))
+         self.check(error, operation="hipIpcCloseMemHandle")
+ 
++    def allocate_device(self, size: int) -> int:
++        """Allocate with plain hipMalloc; return its exact base, never a tensor view.
++
++        The allocation is cached/default device memory. This method establishes
++        the IPC allocation contract, not in-kernel inter-GPU coherence.
++        """
++        return self._allocate_zeroed(size, uncached=False)
++
+     def allocate_uncached(self, size: int) -> int:
+-        """Allocate and zero uncached device memory, returning its raw pointer."""
+-
++        """Preserve the original uncached allocation for qualified deployments."""
++        return self._allocate_zeroed(size, uncached=True)
++
++    def _allocate_zeroed(self, size: int, *, uncached: bool) -> int:
++        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
++            raise ValueError("Device allocation size must be a positive integer")
+         buffer = ctypes.c_void_p()
+-        error = self.library().hipExtMallocWithFlags(
+-            ctypes.byref(buffer),
+-            ctypes.c_size_t(size),
+-            ctypes.c_uint(HIP_DEVICE_MALLOC_UNCACHED),
+-        )
+-        self.check(error, operation="hipExtMallocWithFlags")
++        library = self.library()
++        if uncached:
++            operation = "hipExtMallocWithFlags"
++            error = library.hipExtMallocWithFlags(
++                ctypes.byref(buffer), ctypes.c_size_t(size),
++                ctypes.c_uint(HIP_DEVICE_MALLOC_UNCACHED))
++        else:
++            operation = "hipMalloc"
++            error = library.hipMalloc(ctypes.byref(buffer), ctypes.c_size_t(size))
++        self.check(error, operation=operation)
+         if buffer.value is None:
+-            raise RuntimeError("hipExtMallocWithFlags returned a null pointer")
+-        error = self.library().hipMemset(buffer, 0, ctypes.c_size_t(size))
++            raise RuntimeError(f"{operation} returned a null pointer")
++        error = library.hipMemset(buffer, 0, ctypes.c_size_t(size))
+         if int(error) != 0:
+-            cleanup_error = self.library().hipFree(buffer)
++            cleanup_error = library.hipFree(buffer)
+             try:
+                 self.check(error, operation="hipMemset")
+             except RuntimeError as exc:
+                 if int(cleanup_error) != 0:
+                     raise RuntimeError(f"{exc}; cleanup hipFree also failed with hipError({cleanup_error})") from exc
+                 raise
+-        self.check(error, operation="hipMemset")
+         return int(buffer.value)
+ 
+     def free_device_memory(self, device_pointer: int) -> None:
+@@ -186,6 +246,11 @@
+     """Close a peer mapping returned by :func:`open_ipc_handle`."""
+ 
+     _DEFAULT_RUNTIME.close_ipc_handle(mapped_base)
++
++
++def allocate_device(size: int) -> int:
++    """Allocate zeroed device memory with plain hipMalloc."""
++    return _DEFAULT_RUNTIME.allocate_device(size)
+ 
+ 
+ def allocate_uncached(size: int) -> int:
+@@ -217,6 +282,9 @@
+     "HIP_IPC_HANDLE_BYTES",
+     "HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS",
+     "HipRuntime",
++    "HipError",
++    "allocate_device",
++    "ipc_export_diagnostic",
+     "allocate_uncached",
+     "check_hip_error",
+     "close_ipc_handle",
+--- a/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/peer.py
++++ b/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/peer.py
+@@ -1,18 +1,19 @@
+-"""Dedicated uncached IPC mailboxes for same-host TP2/TP4 attention SUM.
+-
+-Uses FlyDSL v0.5.0's vendored HIP host allocation/IPC wrapper. GPU code remains
++"""Dedicated IPC mailboxes for same-host TP2/TP4 attention SUM.
++
++Uses a locally adapted FlyDSL v0.5.0 HIP host allocation/IPC wrapper. GPU code remains
+ FlyDSL. No PyTorch caching-allocator allocation is exported. Construction and
+ explicit teardown are collective; destruction never implicitly frees buffers.
+ """
+ from __future__ import annotations
+ 
+ import ctypes
++import os
+ from pathlib import Path
+ import socket
+ 
+ import torch
+ 
+-from ._hip_ipc import HipRuntime
++from ._hip_ipc import HipRuntime, ipc_export_diagnostic
+ from ..mono.peer_layout import arena_bytes
+ from ..mono.peer_layout import READY, DONE, EPOCH
+ 
+@@ -23,6 +24,10 @@
+     if any(r.get("error") for r in records):
+         raise RuntimeError("IPC allocation failed: " + "; ".join(
+             f"rank {r['rank']}: {r['error']}" for r in records if r.get("error")))
++    if len({r.get("allocator", "uncached") for r in records}) != 1:
++        raise RuntimeError("TP ranks disagree on QWEN38_IPC_ALLOCATOR")
++    if len({r.get("ipc_mode", "<unset>") for r in records}) != 1:
++        raise RuntimeError("TP ranks have different HSA_ENABLE_IPC_MODE_LEGACY settings; restart all ranks with the same launch environment")
+     if any(r["host"] != records[0]["host"] for r in records):
+         raise RuntimeError("Fused attention IPC requires all TP ranks on the same host")
+     if len({r["bus"] for r in records}) != tp:
+@@ -34,6 +39,10 @@
+ class PeerArena:
+     def __init__(self, device, config, collective):
+         self.device = torch.device(device)
++        if self.device.type != "cuda":
++            raise ValueError("PeerArena requires a ROCm CUDA device")
++        if self.device.index is None:
++            self.device = torch.device("cuda", torch.cuda.current_device())
+         self.collective = collective
+         self.own = 0
+         self.opened = []
+@@ -43,10 +52,17 @@
+         if config.tp_size not in (2, 4):
+             raise ValueError("PeerArena requires TP2 or TP4")
+         self.size = arena_bytes(config.hidden_size)
+-        record = {"rank": config.tp_rank, "size": self.size, "protocol": 1, "error": None}
+-        try:
++        record = {"rank": config.tp_rank, "size": self.size, "protocol": 1, "error": None,
++                  "ipc_mode": os.environ.get("HSA_ENABLE_IPC_MODE_LEGACY", "<unset>")}
++        phase = "runtime setup"
++        self.allocator = os.environ.get("QWEN38_IPC_ALLOCATOR", "uncached")
++        record["allocator"] = self.allocator
++        try:
++            if self.allocator not in ("hipmalloc", "uncached"):
++                raise ValueError("QWEN38_IPC_ALLOCATOR must be hipmalloc or uncached")
+             self.runtime = HipRuntime()
+             lib = self.runtime.library()
++            self.runtime.set_device(self.device.index)
+             lib.hipDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+             lib.hipDeviceGetPCIBusId.restype = ctypes.c_int
+             lib.hipDeviceGetByPCIBusId.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_char_p]
+@@ -60,18 +76,33 @@
+             # are refused rather than guessed to be the same physical host.
+             record["host"] = (socket.gethostname(), Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+             record["bus"] = bus.value.decode()
+-            self.own = self.runtime.allocate_uncached(self.size)
+-            torch.cuda.synchronize(self.device)
+-            record["handle"] = self.runtime.get_ipc_handle(self.own)
+-        except Exception as exc:
+-            record["error"] = f"{type(exc).__name__}: {exc}"
++            phase = f"{self.allocator} allocation and zeroing"
++            allocate = (self.runtime.allocate_device if self.allocator == "hipmalloc"
++                        else self.runtime.allocate_uncached)
++            # Export the exact allocation base, before adding any mailbox offsets.
++            self.own = allocate(self.size)
++            torch.cuda.synchronize(self.device)
++            phase = "IPC handle export"
++            try:
++                record["handle"] = self.runtime.get_ipc_handle(self.own)
++            except Exception as exc:
++                raise RuntimeError(ipc_export_diagnostic(
++                    exc, size=self.size, device=self.device.index,
++                    library=getattr(lib, "_name", "<unknown>"), allocator=self.allocator)) from exc
++        except Exception as exc:
++            record["error"] = f"{phase}: {type(exc).__name__}: {exc}"
+         records = collective.gather_host(record)
+         try:
+             validate_topology(records, config.tp_size, self.size)
+-        except Exception:
++        except Exception as bootstrap_error:
+             if self.own:
+-                self.runtime.free_device_memory(self.own)
+-                self.own = 0
++                try:
++                    self.runtime.free_device_memory(self.own)
++                    self.own = 0
++                except Exception as cleanup_error:
++                    raise RuntimeError(
++                        f"{bootstrap_error}; owner cleanup also failed: {cleanup_error}. "
++                        "Stop all workers; the allocation is retained until process exit.") from cleanup_error
+             raise
+         records = sorted(records, key=lambda x: x["rank"])
+         error = None
+--- /dev/null
++++ b/qwen38_decode_flydsl050_TP4_2/diagnose_ipc.py
+@@ -0,0 +1,147 @@
++"""Probe local HIP IPC export before loading torch, vLLM, FlyDSL or a checkpoint.
++
++Each case runs in a fresh Python process. Export success does not establish
++peer import, GPU peer loads, or READY/DONE protocol correctness.
++"""
++
++from __future__ import annotations
++
++import argparse
++import ctypes
++import importlib.util
++import json
++import os
++from pathlib import Path
++import platform
++import subprocess
++import sys
++
++ENVIRONMENT_KEYS = (
++    "HSA_ENABLE_IPC_MODE_LEGACY",
++    "ROCM_PATH",
++    "HIP_VISIBLE_DEVICES",
++    "ROCR_VISIBLE_DEVICES",
++    "CUDA_VISIBLE_DEVICES",
++)
++
++
++def load_wrapper():
++    # Importing specialized_decode normally imports torch through __init__.
++    # Load just this stdlib-only file so ROCr mode is fixed before initialization.
++    path = Path(__file__).resolve().parent / "specialized_decode/runtime/_hip_ipc.py"
++    spec = importlib.util.spec_from_file_location("qwen_ipc_probe_runtime", path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def configure(lib, name, arguments):
++    function = getattr(lib, name)
++    function.restype = ctypes.c_int
++    function.argtypes = arguments
++    return function
++
++
++def probe(device, size, allocator, runtime=None):
++    result = {
++        "device": device,
++        "bytes": size,
++        "allocator": allocator,
++        "environment": {key: os.environ.get(key, "<unset>") for key in ENVIRONMENT_KEYS},
++        "kernel": platform.release(),
++        "stage": "load_runtime",
++        "success": False,
++    }
++    pointer = 0
++    try:
++        runtime = runtime or load_wrapper().HipRuntime()
++        lib = runtime.library()
++        result["runtime_library"] = str(getattr(lib, "_name", "<unknown>"))
++        for name in ("hipRuntimeGetVersion", "hipDriverGetVersion"):
++            value = ctypes.c_int()
++            runtime.check(configure(lib, name, [ctypes.POINTER(ctypes.c_int)])(ctypes.byref(value)), operation=name)
++            result[name] = value.value
++        result["stage"] = "select_device"
++        runtime.set_device(device)
++        result["stage"] = "allocate"
++        if allocator == "uncached":
++            pointer = runtime.allocate_uncached(size)
++        else:
++            pointer = runtime.allocate_device(size)
++        result["stage"] = "synchronize"
++        runtime.check(configure(lib, "hipDeviceSynchronize", [])(), operation="hipDeviceSynchronize")
++        result["stage"] = "export"
++        handle = runtime.get_ipc_handle(pointer)
++        result["handle_bytes"] = len(handle)
++        if len(handle) != 64:
++            raise RuntimeError("Unexpected IPC handle size")
++        # Do not print opaque handles or addresses. This process owns no imports.
++        result["success"] = True
++        result["stage"] = "complete"
++    except Exception as error:
++        result["error"] = str(error)
++        result["hip_status"] = getattr(error, "code", None)
++    finally:
++        if pointer:
++            try:
++                runtime.free_device_memory(pointer)
++            except Exception as error:
++                result["cleanup_error"] = str(error)
++                result["success"] = False
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--devices", default="0,1", help="HIP-visible device ordinals")
++    parser.add_argument("--bytes", type=int, default=164352, help="Production mailbox bytes")
++    parser.add_argument("--compare-modes", action="store_true", help="Test inherited, 0 and 1 in fresh processes")
++    parser.add_argument("--timeout", type=float, default=30, help="Per-case process timeout in seconds")
++    parser.add_argument("--production-allocator", choices=("malloc", "uncached"),
++                        default="malloc" if os.environ.get("QWEN38_IPC_ALLOCATOR") == "hipmalloc" else "uncached")
++    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
++    parser.add_argument("--allocator", choices=("malloc", "uncached"), help=argparse.SUPPRESS)
++    args = parser.parse_args()
++    try:
++        devices = [int(value) for value in args.devices.split(",")]
++    except ValueError:
++        parser.error("--devices must be comma-separated integer ordinals")
++    if not devices or any(value < 0 for value in devices) or args.bytes <= 0 or args.timeout <= 0:
++        parser.error("Use nonnegative devices and positive --bytes/--timeout")
++    if args.worker:
++        if len(devices) != 1 or args.allocator is None:
++            parser.error("Internal worker requires one device and an allocator")
++        print(json.dumps(probe(devices[0], args.bytes, args.allocator)))
++        return
++    cases = []
++    for mode in ([None, "0", "1"] if args.compare_modes else [None]):
++        env = dict(os.environ)
++        if mode is not None:
++            env["HSA_ENABLE_IPC_MODE_LEGACY"] = mode
++        for device in devices:
++            for allocator in ("malloc", "uncached"):
++                command = [sys.executable, str(Path(__file__).resolve()), "--worker",
++                           "--devices", str(device), "--bytes", str(args.bytes),
++                           "--allocator", allocator]
++                try:
++                    completed = subprocess.run(command, env=env, text=True, capture_output=True,
++                                               timeout=args.timeout, check=True)
++                    record = json.loads(completed.stdout)
++                except (subprocess.SubprocessError, ValueError) as error:
++                    record = {"device": device, "allocator": allocator, "success": False,
++                              "stage": "worker", "error": str(error)}
++                record["mode_case"] = "inherited" if mode is None else mode
++                cases.append(record)
++                print(json.dumps(record), flush=True)
++    # Matrix mode can succeed when mode 0 passes the selected allocation cases,
++    # even if deliberately tested legacy mode fails. Inspect each printed case.
++    production_mode = "0" if args.compare_modes else "inherited"
++    passed = all(case["success"] for case in cases
++                 if case["mode_case"] == production_mode and case["allocator"] == args.production_allocator)
++    print(json.dumps({"exports_passed": passed, "allocator": args.production_allocator, "mode_case": production_mode,
++                      "scope": "local export only; peer import/read and kernel execution NOT tested"}))
++    raise SystemExit(0 if passed else 1)
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/qwen38_decode_flydsl050_TP4_2/tests/test_ipc_diagnostics.py
+@@ -0,0 +1,190 @@
++"""Host HIP ABI/cleanup tests; no GPU execution is simulated as a hardware pass."""
++
++import ctypes
++import os
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from diagnose_ipc import probe
++from specialized_decode.runtime._hip_ipc import HipError, HipRuntime, ipc_export_diagnostic
++from specialized_decode.runtime.peer import PeerArena, validate_topology
++
++
++class Function:
++    def __init__(self, action):
++        self.action = action
++
++    def __call__(self, *args):
++        return self.action(*args)
++
++
++def value(item):
++    return item.value if hasattr(item, "value") else item
++
++
++class Library:
++    _name = "/fake/libamdhip64.so"
++
++    def __init__(self, export_status=0, memset_status=0):
++        self.export_status, self.memset_status = export_status, memset_status
++        self.calls = []
++        for name in ("hipSetDevice", "hipIpcGetMemHandle", "hipIpcOpenMemHandle",
++                     "hipIpcCloseMemHandle", "hipPointerGetAttribute", "hipExtMallocWithFlags",
++                     "hipFree", "hipMemset", "hipDeviceGetPCIBusId", "hipDeviceGetByPCIBusId",
++                     "hipDeviceCanAccessPeer", "hipRuntimeGetVersion", "hipDriverGetVersion",
++                     "hipMalloc", "hipDeviceSynchronize"):
++            setattr(self, name, Function(lambda *args, name=name: self.call(name, args)))
++        self.hipGetErrorString = Function(lambda status: b"invalid argument" if status == 1 else b"test failure")
++
++    def call(self, name, args):
++        self.calls.append((name, args))
++        if name in ("hipExtMallocWithFlags", "hipMalloc"):
++            ctypes.cast(args[0], ctypes.POINTER(ctypes.c_void_p))[0] = 0x100000
++        elif name == "hipIpcGetMemHandle":
++            if self.export_status:
++                return self.export_status
++            ctypes.memset(args[0], 7, 64)
++        elif name == "hipMemset":
++            return self.memset_status
++        elif name == "hipDeviceGetPCIBusId":
++            args[0].value = b"0000:03:00.0"
++        elif name in ("hipRuntimeGetVersion", "hipDriverGetVersion"):
++            ctypes.cast(args[0], ctypes.POINTER(ctypes.c_int))[0] = 70200000
++        return 0
++
++
++class IpcDiagnosticsTests(unittest.TestCase):
++    def test_status_operation_and_base_pointer_are_preserved(self):
++        lib = Library(export_status=1)
++        runtime = HipRuntime(lib)
++        with self.assertRaises(HipError) as caught:
++            runtime.get_ipc_handle(0x12340000)
++        self.assertEqual(caught.exception.code, 1)
++        self.assertEqual(caught.exception.operation, "hipIpcGetMemHandle")
++        self.assertIn("HIP status 1", str(caught.exception))
++        self.assertEqual(value(lib.calls[-1][1][1]), 0x12340000)
++
++    def test_exact_binary_handle_size(self):
++        self.assertEqual(HipRuntime(Library()).get_ipc_handle(0x100000), bytes([7]) * 64)
++
++    def test_mailbox_remains_uncached(self):
++        lib = Library()
++        pointer = HipRuntime(lib).allocate_uncached(164352)
++        self.assertEqual(pointer, 0x100000)
++        name, args = lib.calls[0]
++        self.assertEqual(name, "hipExtMallocWithFlags")
++        self.assertEqual((value(args[1]), value(args[2])), (164352, 3))
++
++    def test_zero_failure_frees_owner(self):
++        lib = Library(memset_status=1)
++        with self.assertRaises(HipError):
++            HipRuntime(lib).allocate_uncached(164352)
++        self.assertEqual([name for name, _ in lib.calls], ["hipExtMallocWithFlags", "hipMemset", "hipFree"])
++
++    def test_diagnostic_does_not_mutate_runtime_mode(self):
++        with patch.dict(os.environ, {"HSA_ENABLE_IPC_MODE_LEGACY": "1"}):
++            message = ipc_export_diagnostic(HipError("hipIpcGetMemHandle", 1, "invalid argument"),
++                                            size=164352, device=1, library="hip")
++            self.assertIn("HSA_ENABLE_IPC_MODE_LEGACY=0", message)
++            self.assertIn("restart every worker", message)
++            self.assertIn("bypasses PyTorch", message)
++            self.assertEqual(os.environ["HSA_ENABLE_IPC_MODE_LEGACY"], "1")
++
++    def test_other_status_is_not_misdiagnosed_as_invalid_value(self):
++        message = ipc_export_diagnostic(HipError("hipIpcGetMemHandle", 2, "out of memory"),
++                                        size=164352, device=0, library="hip")
++        self.assertNotIn("legacy IPC export returns", message)
++        self.assertIn("out of memory", message)
++
++    def test_modes_must_match_across_ranks(self):
++        records = [dict(rank=r, error=None, host=("host", "boot"), bus=str(r), size=164352,
++                        protocol=1, handle=bytes(64), ipc_mode=str(r)) for r in range(2)]
++        with self.assertRaisesRegex(RuntimeError, "different HSA_ENABLE"):
++            validate_topology(records, 2, 164352)
++        records[1]["ipc_mode"] = "0"
++        validate_topology(records, 2, 164352)
++
++    def test_export_failure_selects_device_frees_allocation_and_never_maps(self):
++        lib = Library(export_status=1)
++        runtime = HipRuntime(lib)
++        collective = SimpleNamespace(gather_host=lambda record: [record, {**record, "rank": 1}])
++        config = SimpleNamespace(tp_size=2, tp_rank=0, hidden_size=5120)
++        with patch("specialized_decode.runtime.peer.HipRuntime", return_value=runtime), \
++             patch("torch.cuda.synchronize"):
++            with self.assertRaisesRegex(RuntimeError, "IPC handle export.*HIP status 1"):
++                PeerArena("cuda:1", config, collective)
++        names = [name for name, _ in lib.calls]
++        self.assertLess(names.index("hipSetDevice"), names.index("hipExtMallocWithFlags"))
++        self.assertEqual(value(lib.calls[names.index("hipSetDevice")][1][0]), 1)
++        self.assertEqual(names.count("hipFree"), 1)
++        self.assertNotIn("hipIpcOpenMemHandle", names)
++
++    def test_probe_reports_export_stage_and_cleans_up(self):
++        lib = Library(export_status=1)
++        result = probe(0, 164352, "uncached", HipRuntime(lib))
++        self.assertFalse(result["success"])
++        self.assertEqual(result["stage"], "export")
++        self.assertEqual(result["hip_status"], 1)
++        self.assertEqual(lib.calls[-1][0], "hipFree")
++
++    def test_probe_compares_raw_malloc_and_uncached_without_torch_allocations(self):
++        for allocator, call in (("malloc", "hipMalloc"), ("uncached", "hipExtMallocWithFlags")):
++            lib = Library()
++            result = probe(0, 164352, allocator, HipRuntime(lib))
++            self.assertTrue(result["success"])
++            self.assertEqual(result["handle_bytes"], 64)
++            self.assertIn(call, [name for name, _ in lib.calls])
++            self.assertNotIn("handle", result)
++
++    def test_plain_malloc_returns_and_exports_exact_base(self):
++        lib = Library()
++        runtime = HipRuntime(lib)
++        pointer = runtime.allocate_device(164352)
++        runtime.get_ipc_handle(pointer)
++        runtime.free_device_memory(pointer)
++        self.assertEqual([n for n, _ in lib.calls],
++                         ["hipMalloc", "hipMemset", "hipIpcGetMemHandle", "hipFree"])
++        self.assertEqual(value(lib.calls[0][1][1]), 164352)
++        self.assertEqual(value(lib.calls[2][1][1]), 0x100000)
++        self.assertEqual(value(lib.calls[3][1][0]), 0x100000)
++
++    def test_plain_malloc_zero_failure_frees_base(self):
++        lib = Library(memset_status=1)
++        with self.assertRaisesRegex(HipError, "hipMemset"):
++            HipRuntime(lib).allocate_device(164352)
++        self.assertEqual([n for n, _ in lib.calls], ["hipMalloc", "hipMemset", "hipFree"])
++
++    def test_invalid_allocation_sizes_do_not_call_hip(self):
++        lib = Library()
++        for size in (0, -1, True, 1.5):
++            with self.assertRaises(ValueError):
++                HipRuntime(lib).allocate_device(size)
++        self.assertEqual(lib.calls, [])
++
++    def test_allocators_must_agree(self):
++        records = [dict(rank=r, error=None, allocator=a)
++                   for r, a in enumerate(("hipmalloc", "uncached"))]
++        with self.assertRaisesRegex(RuntimeError, "QWEN38_IPC_ALLOCATOR"):
++            validate_topology(records, 2, 164352)
++
++    def test_peer_uses_plain_malloc_and_never_silently_retries(self):
++        lib = Library(export_status=1)
++        runtime = HipRuntime(lib)
++        collective = SimpleNamespace(gather_host=lambda record: [record, {**record, "rank": 1}])
++        config = SimpleNamespace(tp_size=2, tp_rank=0, hidden_size=5120)
++        with patch.dict(os.environ, {"QWEN38_IPC_ALLOCATOR": "hipmalloc"}), \
++             patch("specialized_decode.runtime.peer.HipRuntime", return_value=runtime), \
++             patch("torch.cuda.synchronize"):
++            with self.assertRaisesRegex(RuntimeError, "dedicated hipmalloc"):
++                PeerArena("cuda:1", config, collective)
++        names = [name for name, _ in lib.calls]
++        self.assertIn("hipMalloc", names)
++        self.assertNotIn("hipExtMallocWithFlags", names)
++        self.assertNotIn("hipIpcOpenMemHandle", names)
++        self.assertEqual(names.count("hipFree"), 1)
++        self.assertEqual(value(lib.calls[names.index("hipIpcGetMemHandle")][1][1]), 0x100000)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/qwen38_decode_flydsl050_TP4_2/pyproject.toml
++++ b/qwen38_decode_flydsl050_TP4_2/pyproject.toml
+@@ -4,7 +4,7 @@
+ 
+ [project]
+ name = "qwen38-gfx1201-decode"
+-version = "0.4.0"
++version = "0.4.2"
+ description = "Qwen3.5-compatible 27B TP1/TP2/TP4 BF16 FlyDSL 0.5.0 attention SUM and FFN source and validation tools"
+ requires-python = ">=3.10"
+ dependencies = []
