@@ -1,0 +1,42 @@
+{
+  "package_version": "0.4.4",
+  "reviewed_temp_commit": "7fc6f18f31a072b127ada26bb64c9cd915ca872d",
+  "reviewed_directory": "qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2",
+  "base_package_version": "0.4.3",
+  "flydsl_version": "0.5.0",
+  "target": "gfx1201",
+  "supported_tp": [
+    1,
+    2,
+    4
+  ],
+  "host_unittest_cases_passed": 66,
+  "host_test_log": "validation/ll_host_tests.txt",
+  "python_syntax": "passed",
+  "ruff_F821_F822_F823": "passed",
+  "isa_generation_variants": 72,
+  "isa_ffn_simple_variants": 32,
+  "isa_ffn_ll_variants": 32,
+  "isa_ll_probe_variants": 8,
+  "isa_report": "validation/ll_isa/compile_report.json",
+  "ll_atomic_ir_contract": "passed: scalar i64, alignment 8, LLVM system scope, release store/acquire load",
+  "ll_isa_contract": "passed: global_load_b64 and global_store_b64 scope:SCOPE_SYS",
+  "ll_bit_packing_host_contract": "constant-folded raw BF16 special-value patterns and high-bit uint32 epoch passed",
+  "normal_grid_barriers_both_reductions": {
+    "simple": 10,
+    "ll": 6
+  },
+  "ll_epoch_rollover": "zero reserved; full-capacity zero scrub and wrap-generation handshake; resume at one",
+  "abstract_protocol": "TP2/4, two independent word producers per rank over three invocations; all enabled interleavings passed under atomic visibility premise",
+  "ll_arena_bytes": 328192,
+  "two_ll_arenas_bytes_per_gpu": 656384,
+  "new_option": "QWEN38_IPC_PROTOCOL=ll; default simple",
+  "allocator": "hipmalloc/uncached retained; no remote atomic RMW used",
+  "elf_linking": "not tested",
+  "gpu_execution": "not tested: CPU-only torch 2.15.0+cpu, no AMD GPU available",
+  "gpu_numerics_peer_ordering_graphs_faults": "not tested; validate_tp.py adds --ll-stress with raw bit patterns and stale-tag seeding",
+  "loaded_model_quality_performance": "not tested",
+  "vllm_enforce_eager_required": true,
+  "historical_evidence": "Other validation directories are prior-version evidence",
+  "source_patch": "source/docs only; forward application checked separately during packaging"
+}
