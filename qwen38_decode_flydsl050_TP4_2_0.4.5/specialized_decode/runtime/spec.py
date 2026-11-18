@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+HIDDEN_SIZE = 5120
+INTERMEDIATE_SIZE = 17408
+NUM_LAYERS = 64
+MAX_DECODE_TOKENS = 16
+EXPECTED_ARCH = "gfx1201"
+
+
+@dataclass(frozen=True)
+class DecodeConfig:
+    """Use `flydsl` explicitly after running validate.py on the target machine.
+
+    `torch` is a staged parity baseline, not a claimed optimization. Both
+    backends leave attention and its caches with the stock vLLM modules.
+    """
+
+    enabled: bool = True
+    backend: str = "torch"
+    max_rows: int = 16
+    hidden_size: int = HIDDEN_SIZE
+    intermediate_size: int = INTERMEDIATE_SIZE
+    num_layers: int = NUM_LAYERS
+    attention_input: str = "reduced"
+    ffn_reduction: str = "collective"
+    ipc_protocol: str = "simple"
+    tp_size: int = 1
+    tp_rank: int = 0
+    eps: float = 1e-6
+    blocks: int = 64
+    max_spins: int = 10_000_000
+    cache_dir: str | None = None
+
+    @property
+    def local_intermediate_size(self):
+        return self.intermediate_size // self.tp_size
+
+    @property
+    def fused_attention_reduce(self):
+        return self.attention_input == "partial" and self.tp_size > 1
+
+    @property
+    def fused_ffn_reduce(self):
+        return self.ffn_reduction == "ipc" and self.tp_size > 1
+
+    @property
+    def grid_barriers_per_launch(self):
+        """Normal-path count; LL adds two per arena on rare epoch rollover."""
+        if self.ipc_protocol == "ll_double":
+            return 2 + int(self.fused_attention_reduce)
+        per_reduce = 2 if self.ipc_protocol == "ll" else 4
+        return 2 + per_reduce * (int(self.fused_attention_reduce) + int(self.fused_ffn_reduce))
+
+    def __post_init__(self):
+        if self.ipc_protocol not in ("simple", "ll", "ll_double"):
+            raise ValueError("ipc_protocol must be simple, ll or ll_double")
+        if self.ffn_reduction not in ("collective", "ipc"):
+            raise ValueError("ffn_reduction must be collective or ipc")
+        if self.attention_input not in ("reduced", "partial"):
+            raise ValueError("attention_input must be reduced or partial")
+        if self.tp_size not in (1, 2, 4) or not 0 <= self.tp_rank < self.tp_size:
+            raise ValueError("Expected TP1, TP2, or TP4 and a valid rank within that group")
+        if self.intermediate_size % (16 * self.tp_size):
+            raise ValueError("Each TP intermediate shard must be a multiple of 16")
+        if self.backend not in ("torch", "flydsl"):
+            raise ValueError("backend must be 'torch' or 'flydsl'")
+        if not 1 <= self.max_rows <= MAX_DECODE_TOKENS:
+            raise ValueError("max_rows must be in [1, 16]")
+        if any(x <= 0 or x % 16 for x in (self.hidden_size, self.intermediate_size)):
+            raise ValueError("hidden/intermediate dimensions must be positive multiples of 16")
+        if self.num_layers <= 0 or not 1 <= self.blocks <= 64:
+            raise ValueError("num_layers must be positive and blocks in [1, 64]")
+        if not math.isfinite(self.eps) or self.eps <= 0:
+            raise ValueError("eps must be finite and positive")
+        if not 1 <= self.max_spins < 2**31:
+            raise ValueError("max_spins must be in [1, 2**31)")

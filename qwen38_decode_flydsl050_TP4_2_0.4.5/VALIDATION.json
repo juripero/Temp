@@ -1,0 +1,59 @@
+{
+  "package_version": "0.4.5",
+  "base_package_version": "0.4.4",
+  "base_archive": "qwen38_decode_flydsl050_TP4_2_ll_0.4.4.zip",
+  "base_archive_sha256": "c2ba9803761ef4ac8657dd6dc0e8c7be1a9895ea92498309dcb727eb543050ca",
+  "original_temp_commit": "7fc6f18f31a072b127ada26bb64c9cd915ca872d",
+  "flydsl_version": "0.5.0",
+  "target": "gfx1201",
+  "supported_tp": [
+    1,
+    2,
+    4
+  ],
+  "host_unittest_cases_passed": 74,
+  "host_test_log": "validation/double_host_tests.txt",
+  "python_syntax": "passed",
+  "ruff_F821_F822_F823": "passed",
+  "isa_generation_variants": 112,
+  "ffn_variants_per_protocol": 32,
+  "protocols": [
+    "simple",
+    "ll",
+    "ll_double"
+  ],
+  "bit_pattern_probe_variants_per_ll_protocol": 8,
+  "isa_report": "validation/double_isa/compile_report.json",
+  "ll_system_scope_b64_access_contract": "passed for both LL protocols",
+  "normal_grid_barriers_both_reductions": {
+    "simple": 10,
+    "ll": 6,
+    "ll_double": 3
+  },
+  "ll_double_arena_bytes": 656384,
+  "two_ll_double_arenas_bytes_per_gpu": 1312768,
+  "ll_double_initial_sequence": 2,
+  "ll_double_cycle": 8589934590,
+  "ll_double_counter_scope": "per CTA, owner-local; no completion or credit signal",
+  "ll_double_reuse_premise": "whole kernel completion on one serialized stream; every participating invocation consumes all peers",
+  "ll_double_rollover": "scrub only the selected bank at sequence 0/1, full capacity, wrap-generation handshake",
+  "normal_path_done": "removed for ll_double; existing ll/simple retained",
+  "abstract_protocol": "TP2/4 variable rows and two rollovers passed; single-bank/no-scrub/scrub-both negative variants rejected",
+  "gpu_qualification_added": [
+    "zero-row skips",
+    "per-CTA counter agreement",
+    "unused DONE remains zero",
+    "alternating rank launch skew",
+    "both-bank stale-tag poisoning",
+    "independent arena wrap"
+  ],
+  "elf_linking": "not tested",
+  "gpu_execution": "not tested: CPU-only build environment, no AMD GPU available",
+  "gpu_numerics_ipc_coherence_live_occupancy_graphs_faults": "not tested; qualification harness provided",
+  "loaded_model_quality_performance": "not tested",
+  "vllm_enforce_eager_required": true,
+  "new_option": "QWEN38_IPC_PROTOCOL=ll_double; default remains simple",
+  "workload_contract": "same nonempty call sequence and physical rows on every rank; no overlapping workspace use",
+  "patch": "ll_double.patch against extracted 0.4.4 package root; source/docs only",
+  "historical_evidence": "all other validation directories are previous-version evidence"
+}

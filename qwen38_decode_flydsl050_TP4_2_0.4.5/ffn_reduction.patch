@@ -1,0 +1,1703 @@
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/IPC_TP2_FIX.md b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/IPC_TP2_FIX.md
+index bff075f..f34862c 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/IPC_TP2_FIX.md
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/IPC_TP2_FIX.md
+@@ -1,8 +1,13 @@
+-# Exact-base hipMalloc IPC allocation option — 0.4.2
++# Exact-base hipMalloc IPC allocation option — introduced in 0.4.2
+ 
+ Reviewed `juripero/Temp` commit `efe05e2a28d35c844d34b52f20d3aebc349f5b9c`,
+ directory `qwen38_decode_flydsl050_TP4_2`.
+ 
++This guide describes the allocator change retained in version 0.4.3. For the
++new fused FFN reduction, installation and current validation, use README.md and
++FFN_REDUCTION.md. The historical `ipc_fix.patch` is against the older reviewed
++commit; the current patch is `ffn_reduction.patch` against commit aeda0e4.
++
+ ## Diagnosis
+ 
+ The export at `runtime/peer.py` already receives `self.own`, the unmodified
+@@ -45,7 +50,8 @@ record["handle"] = self.runtime.get_ipc_handle(self.own)
+ ## Installation and local export test
+ 
+ Install this complete package in the workers' Python environment and restart
+-all workers. The vLLM model patch and GPU kernel are unchanged from 0.4.1.
++all workers. The 0.4.2 allocator update left the model patch and GPU kernel unchanged from 0.4.1.
++Version 0.4.3 changes the GPU kernel; install the complete current package.
+ If that model integration is installed, it does not need to be reapplied.
+ 
+ ```bash
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/NOTICE.txt b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/NOTICE.txt
+index 1f27778..23744e6 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/NOTICE.txt
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/NOTICE.txt
+@@ -18,3 +18,7 @@ qualification as described in README.md.
+ Version 0.4.2 adds an explicit plain-hipMalloc allocator option and allocator
+ agreement checks. The peer GPU protocol remains unchanged and requires
+ separate qualification when using the new memory type.
++
++Version 0.4.3 adds a separate FFN-output peer reduction phase, deferred FFN
++layer scaling, and matching host/compiler/test support. It retains the same
++HIP allocator options and requires hardware qualification for the new phase.
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/README.md b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/README.md
+index ec56119..0dee867 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/README.md
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/README.md
+@@ -1,350 +1,207 @@
+-# Qwen 27B TP1 / TP2 / TP4 — fused attention SUM + BF16 FFN
+-
+-Package 0.4.2, FlyDSL 0.5.0, gfx1201.
+-
+-For `hipIpcGetMemHandle failed: invalid argument`, see [IPC_TP2_FIX.md](IPC_TP2_FIX.md).
+-Version 0.4.2 adds **`QWEN38_IPC_ALLOCATOR=hipmalloc`**, using plain `hipMalloc`
+-and exporting its exact base. This is an explicit allocation-compatibility
+-option; the default remains `uncached`. Changing memory type does not by itself
+-qualify the persistent peer protocol's cache visibility. Run the supplied GPU
+-validator before using the option for serving. No GPU was available here.
+-
+-This adds an opt-in attention all-reduce **inside the persistent FlyDSL kernel**
+-for TP2/TP4. vLLM computes each rank's attention output-projection partial; the
+-kernel sums it before residual addition and RMSNorm. TP1 and the previous
+-already-reduced attention mode remain supported. This is experimental code:
+-host tests and gfx1201 ISA generation passed; no GPU execution was available.
+-The GPU kernel is Python FlyDSL, with native RDNA4 BF16 WMMA. There is no embedded
+-HIP/C++ source, PyTorch extension loader, or custom HIP compilation step. FlyDSL
+-still uses ROCm's linker and HIP runtime to load and launch GPU code.
+-
+-Pinned release: **ROCm/FlyDSL v0.5.0**, commit
+-`226cde8d2a84bc2687c8d69587607fddf0c16f2f`. Runtime compilation rejects other
+-FlyDSL versions and targets. This package replaces the old `specialized_decode`
+-package; install one variant at a time.
+-
+-## Model contract
+-
+-The requested “Qwen3.8 27B” keeps the Qwen3.5-compatible architecture assumed by
+-the original source: `qwen3_5_text`, 64 layers, hidden size 5120, intermediate size
+-17408, dense SwiGLU, and Gemma-style `1 + weight` RMSNorm with epsilon 1e-6.
+-The adapter checks these properties rather than treating the model name as a
+-guarantee. A different checkpoint layout requires another adapter.
+-
+-TP1/TP2/TP4, PP1, unquantized BF16, no LoRA/speculative decoding, and gfx1201 are required.
+-VRAM is assumed sufficient for the weights. Stock vLLM retains attention,
+-DeltaNet state, KV caches, embeddings, and final normalization. The vLLM adapter
+-requires **`--enforce-eager`**; full vLLM graph/Dynamo integration is not provided.
+-
+-## Implementation
+-
+-With `QWEN38_ATTENTION_INPUT=partial`, one persistent launch per rank performs:
+-
+-1. Publish BF16 attention partials into dedicated IPC peer buffers.
+-2. Wait for every TP rank, then sum peer partials in FP32 in TP-rank order.
+-3. Round attention to BF16 and apply optional attention layer scaling.
+-4. Add the replicated residual once, compute post-attention RMSNorm, and run
+-   the local gate/up, SwiGLU, and down projections.
+-
+-The runner then enqueues the existing BF16 **FFN-output SUM** through the vLLM
+-TP group, followed by optional FFN layer scaling in the executor. That output
+-collective remains separate. The new path removes the separate attention
+-all-reduce launch for eligible decode steps; it does not eliminate its network
+-traffic or fuse both tensor-parallel reductions into one collective.
+-
+-Attention computation, input norm, and caches remain in stock vLLM. The fused
+-path accepts 1–16 physical rows. The grid is 1–64 workgroups of 128 threads / four
+-Wave32 waves; the default is 64, subject to a live residency check.
+-
+-| Release API | Use |
+-|---|---|
+-| `fx.rocdl.WMMA(16, 16, 16, fx.BFloat16, fx.Float32)` | Selects the gfx120x BF16 atom, with eight BF16 elements per operand per lane |
+-| `fx.make_mma_atom` | Constructs the architecture-specific MMA atom |
+-| `fly.mma_atom_call_ssa` | Issues WMMA on vector fragments, following the release's RDNA4 test |
+-| `fx.gpu.shuffle_down(..., 32)` / `fx.SharedAllocator` | Wave32 norm reduction and shared inverse RMS |
+-| `fx.generic_load/store`, `fx.atomic_add/cas`, `fx.memory_fence` | Device-scope grid barriers and sticky faults |
+-| `fx.SyncScope.System` with acquire/release loads, stores, and fences | Inter-GPU publication and retirement of IPC attention buffers |
+-| `flyc.compile` with null typed pointers | Compiles without an implicit launch or live GPU buffers |
+-| `CompiledFunction.max_blocks_per_cu()` | Checks the actual compiled kernel's residency before use |
+-| `fx.Stream` | Launches on the current PyTorch ROCm stream |
+-
+-The atom's correct mappings are retained: A/B use feature/token `lane % 16`
+-and K positions `(lane // 16) * 8 + j`; C uses token `lane % 16` and feature
+-`tile * 16 + (lane // 16) * 8 + j`. Each wave owns distinct feature tiles.
+-Gate and up accumulators round separately to BF16 before FP32 SwiGLU, then
+-round to BF16 before the down projection. RMSNorm uses the unrounded FP32
+-residual sum; only the residual output is rounded separately.
+-
+-`mono/_flydsl_kernel.py` and `mono/_peer_kernel.py` contain GPU code;
+-`mono/a16w16.py` contains the compiler/launcher; `runtime/peer.py` owns IPC setup;
+-`runtime/parallel.py` contains the standard collective adapters. The low-level SSA atom wrapper and `ASTRewriter.transform`
+-are intentionally pinned internal interfaces, used in the release's examples
+-and vLLM reference respectively. They are not claimed as version-independent
+-public APIs. No AITER dependency is introduced.
+-
+-## Tensor-parallel layout and ordering
+-
+-`DecodeConfig.intermediate_size` remains the global size. Its
+-`local_intermediate_size` property is `intermediate_size // tp_size`.
+-The vLLM adapter obtains TP size and rank from `get_tp_group()` automatically.
+-Do not shard loaded vLLM tensors again: production binding is zero-copy.
+-
+-| Mode | Local intermediate | Local W13 `[gate_local; up_local]` | Local W2 |
+-|---|---:|---|---|
+-| TP1 | 17408 | `[34816, 5120]` | `[5120, 17408]` |
+-| TP2 | 8704 | `[17408, 5120]` | `[5120, 8704]` |
+-| TP4 | 4352 | `[8704, 5120]` | `[5120, 4352]` |
++# Qwen BF16 mono decode: fused attention and FFN-output reductions
+ 
+-For rank `r`, take its `I/TP` rows from **each** gate/up projection and its
+-matching columns of W2. Splitting the fused global `[gate; up]` matrix into
+-contiguous `2I/TP` chunks is incorrect. `shard_reference_weights()` demonstrates
+-the correct split for validation; production uses vLLM's existing shards.
++Version **0.4.3**, FlyDSL **0.5.0**, target **gfx1201**, TP1/TP2/TP4.
++Built on `juripero/Temp` commit **aeda0e48645ec0725927791e14f529dcd2930d56**,
++directory `qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2`.
+ 
+-There are two explicit input contracts:
++Set **`QWEN38_FFN_REDUCTION=ipc`** to absorb the FFN-output SUM into the
++FlyDSL kernel. With `QWEN38_ATTENTION_INPUT=partial`, eligible decode runs
++attention SUM, residual/RMSNorm, local W13/SwiGLU/W2, FFN-output SUM, and optional
++attention/FFN layer scaling in **one persistent GPU launch per layer per rank**.
++Stock attention computation and the once-per-forward fault check remain outside.
+ 
+-| Setting | vLLM attention projection | Decode boundary | Prefill / ineligible step |
+-|---|---|---|---|
+-| `QWEN38_ATTENTION_INPUT=reduced` (default) | SUM enabled | Previous local FFN kernel | Original stock layer |
+-| `QWEN38_ATTENTION_INPUT=partial` | SUM disabled | Fused IPC attention SUM + local FFN | Explicit TP SUM, then stock post norm and MLP |
+-
+-Post-attention RMSNorm weights and residuals stay replicated. Each rank adds
+-the residual exactly once; residual outputs are never reduced or divided by
+-TP. The local down output rounds to BF16 before its standard SUM. The returned
+-all-reduce tensor is authoritative because vLLM can reduce out-of-place.
+-
+-The attention sum is **rank-ordered FP32 accumulation of BF16 partials**, rounded
+-to BF16 before scaling/norm. The staged torch backend and prefill fallback use a
+-standard FP32 TP SUM followed by BF16 rounding; their collective ordering can
+-differ from the fused kernel. Neither is guaranteed bitwise identical to a
+-stock RCCL BF16 reduction tree. Validate actual-model logits and quality.
+-
+-Fused attention requires all TP GPUs on one host with full directed peer access,
+-working HIP IPC, and a qualified allocation/memory-order combination.
+-The original path uses uncached device allocations; the explicit `hipmalloc`
+-option changes that assumption and requires separate hardware qualification. Every process must see all TP
+-GPUs, with a distinct physical PCI bus ID per rank. Startup checks these
+-conditions, matching host/boot identities, and handle/layout consistency. An
+-unsupported IPC topology raises an error. It does not silently resume with
+-unreduced attention. Cross-node fused attention is not supported. No XGMI
+-assumption is made; PCIe functionality and performance need hardware testing.
+-
+-`runtime/_hip_ipc.py` is adapted from the HIP **host** allocation/IPC wrapper in
+-FlyDSL v0.5.0 (see `NOTICE.txt` and `LICENSE_FLYDSL`), with local error diagnostics
+-and explicit device selection. It uses ctypes for setup,
+-not HIP/C++ GPU kernels. The release's gfx942-specific custom-all-reduce assembly
+-is not used. LLVM lowers generic FlyDSL system-scope operations for gfx1201.
+-
+-Each rank allocates 512 header bytes plus `16 * 5120 * 2` data bytes = **164352
+-bytes** of IPC storage, plus 160 KiB of private attention scratch. Peer imports
+-map existing storage. Only the owner writes its flags; remote operations are
+-loads, with no remote atomic read-modify-write. The attention payload and FFN
+-output payload are each 10–160 KiB per rank, not total interconnect traffic.
+-
+-At startup, participating ranks compare specialization settings and aggregate
+-support/binding/compilation errors. All workers must receive the same enable
+-flag/backend and execute the same layer/collective sequence. Configuration
+-disagreement fails; a static support refusal is shared by the TP group. At the
+-end of every integrated forward, one additional int32 SUM propagates completed
+-kernel faults to the whole TP group. A remote fault becomes locally sticky;
+-its local diagnostic site may remain zero. Unexpected rank exceptions, killed
+-workers, and transport failures require termination of the whole TP worker
+-group; bounded local grid waits do not provide distributed failure recovery.
+-
+-## Validation actually performed
+-
+-- **48 host tests passed** in version 0.4.2: 15 IPC diagnostics/cleanup cases plus
+-  the 33 existing tests, including TP tests and attention SUM,
+-  residual, layer-scale, prefill, double-reduction guard, topology-refusal, and
+-  installer tests. TP1/TP2/TP4 use real CPU tensor math with threaded simulated
+-  collectives, not Gloo/RCCL or GPUs.
+-- An abstract READY/DONE protocol test explores all interleavings of three
+-  epochs for TP2 and TP4 across uint32 rollover. It checks publication, no
+-  premature overwrite, and progress assuming acquire/release ordering. It
+-  does not validate the GPU/interconnect memory model.
+-- All Python sources compiled. Installer application, AST validity, and
+-  idempotence passed on temporary copies of the pinned vLLM sources, both
+-  fresh and upgraded from the preceding model-loop patch.
+-- Real FlyDSL tracing, MLIR lowering, and LLVM **gfx1201 ISA generation passed
+-  for 16 variants**: small/full dimensions, TP1/2/4, reduced/partial inputs,
+-  and first/last peer ranks for partial TP2/4. Peer variants contain
+-  `scope:SCOPE_SYS` operations. See `validation/isa/compile_report.json`.
+-- Full-size fused-peer variants report 45 VGPRs, 36 SGPRs, 24 fixed LDS bytes,
+-  and zero private-segment bytes. These are compiler metadata, not measured
+-  occupancy or throughput.
+-- Real CPU/Gloo validation in the preceding TP work was blocked at socket
+-  initialization (`Operation not permitted`). No distributed pass is claimed.
+-- **ELF linking, HIP IPC mappings, GPU numerical parity, live residency,
+-  multi-GPU memory ordering, graph replay, fault injection, loaded-model quality,
+-  and performance remain unverified**. No AMD GPU or ROCm linker was available.
+-  ISA generation cannot establish those properties.
+-
+-## Install and qualify
+-
+-Use your existing ROCm PyTorch/vLLM environment and ROCm development toolkit
+-(including `ld.lld`). Keep your ROCm torch installation:
++This is an extension of the HIP IPC package, not the separate RCCL variant.
++The default `QWEN38_FFN_REDUCTION=collective` retains the preceding output
++collective for controlled comparisons. No changes to checkpoint weights or
++vLLM's existing TP sharding are required. Use one package variant at a time.
++
++## Install and enable
++
++Install the complete package in the Python environment used by the workers:
+ 
+ ```bash
+-python -m pip install --no-deps flydsl==0.5.0
+-python -m pip install -e . --no-deps
++python -m pip install --no-deps -e .
+ python -m unittest discover -s tests -v
+-python compile_smoke.py
+-python validate.py --small --graph --fault-test
+-python validate.py --graph --fault-test
+-
+-# One process per GPU; ROCm PyTorch calls its RCCL backend "nccl".
+-torchrun --standalone --nproc-per-node=2 validate_tp.py --attention-partials --attention-scale --small --graph --fault-test
+-torchrun --standalone --nproc-per-node=4 validate_tp.py --attention-partials --attention-scale --small --graph --fault-test
+-torchrun --standalone --nproc-per-node=2 validate_tp.py --attention-partials --attention-scale --graph --fault-test
+-torchrun --standalone --nproc-per-node=4 validate_tp.py --attention-partials --attention-scale --graph --fault-test
+ ```
+ 
+-`compile_smoke.py` defaults to full ELF compilation without a GPU and fails
+-nonzero on a linker/compiler error. For a host without the ROCm linker:
++Keep your working `QWEN38_IPC_ALLOCATOR` and launch-time ROCr/HSA environment.
++The new FFN mailbox uses the same allocator selection as the attention mailbox.
++For the plain-hipMalloc path, the example is:
+ 
+ ```bash
+-python compile_smoke.py --isa-only
++QWEN38_SPECIALIZED_DECODE=1 \
++QWEN38_FFN_BACKEND=flydsl \
++QWEN38_ATTENTION_INPUT=partial \
++QWEN38_FFN_REDUCTION=ipc \
++QWEN38_IPC_ALLOCATOR=hipmalloc \
++  vllm serve /path/to/checkpoint --dtype bfloat16 \
++  --tensor-parallel-size 2 --enforce-eager
+ ```
+ 
+-The latter uses the compiler's assembly output mode in a separate diagnostic
+-process, disables disk caching, and never executes or installs the resulting
+-assembly. It is not a substitute for full compilation and GPU qualification.
+-Do not set `COMPILE_ONLY=1`; typed null pointers already suppress execution.
+-
+-GPU validation checks residuals, norm scratch, SwiGLU scratch, and output at
+-1/2/3/4/7/8/15/16 rows, generation wrap, repeated standalone graph replay with
+-poisoned padding, and a dropped-CTA timeout. Default comparison thresholds are
+-`atol=0.03125`, `rtol=0.02`; residual outputs must match exactly. Diagnose
+-mismatches rather than simply increasing tolerances. Also compare actual-model
+-layer outputs, logits, deterministic generations, and evaluation quality.
+-
+-`validate.py` remains the TP1 GPU test. `validate_tp.py` compares against both
+-an identical-TP staged reference and the unsharded TP1 result (allowing BF16
+-partition/reduction differences). It checks all-reduced outputs on every rank,
+-residuals, local scratch, generation wrap, optional graph replay, and propagation
+-of a rank-zero injected timeout. `--attention-partials` supplies different
+-partials on each rank and checks the summed attention scratch. It also seeds
+-peer epochs at `0xFFFFFFFE` and runs through `0xFFFFFFFF`, `0`, and `1`.
+-`--attention-scale` checks deferred attention scaling. In partial GPU mode,
+-all ranks enter the fault-injected kernel, exercising peer failure waits too. TP graph support remains unqualified until
+-these tests pass on your ROCm/RCCL stack; vLLM serving remains eager.
+-
+-For actual CPU/Gloo checks on a machine that permits local sockets:
++Use `--tensor-parallel-size 4` for TP4. To return to the previous FFN collective,
++restart all workers with `QWEN38_FFN_REDUCTION=collective`. Do not change modes
++mid-run or use different modes on different ranks. Startup logs show the mode.
++`QWEN38_FFN_BACKEND=torch` is a staged numerical reference; it does not fuse GPU
++communication even when `ffn_reduction=ipc` is selected.
++
++The vLLM installer is unchanged from 0.4.2. If that model integration is already
++installed, update this package and restart workers. Otherwise the exact-source
++installer targets vLLM commit `d64414d044a898c6db646dcecd122213accd1732`:
+ 
+ ```bash
+-torchrun --standalone --nproc-per-node=2 validate_tp.py --attention-partials --attention-scale --cpu --small --fault-test
+-torchrun --standalone --nproc-per-node=4 validate_tp.py --attention-partials --attention-scale --cpu --small --fault-test
+-# Two independent TP2 groups; tests subgroup isolation.
+-torchrun --standalone --nproc-per-node=4 validate_tp.py --attention-partials --attention-scale --cpu --small --tp-size=2 --fault-test
++python install_vllm.py /path/to/vllm
++python install_vllm.py /path/to/vllm --apply
+ ```
+ 
+-The CPU simulation is included in `python -m unittest discover -s tests -v`.
+-It does not exercise Gloo or RCCL. Standalone callers must pass an initialized,
+-explicit `TorchTpCollective(group, host_group)` to `FfnRunner` for TP2/TP4 and put the
+-corresponding `tp_size` and `tp_rank` in both config and `LayerWeights`.
+-The IPC host group must be Gloo with the same membership/order as the device
+-TP group. The validator constructs both. Also run validation without
+-`--attention-partials` to qualify the original reduced-input path.
++Review the dry-run diff; the installer preserves backups and refuses unknown
++source anchors. It disables only the attention output-projection reduction
++when `partial` is selected. **Keep stock MLP reduction enabled**, because prefill
++and ineligible decode still use it. Do not globally disable all collectives.
++`ffn_reduction.patch` applies the changes to the exact reviewed Temp commit;
++apply it from the Temp repository root, or install the supplied complete package.
++
++## Supported model and execution
++
++The original Qwen3.5-compatible dense 27B contract remains: model type
++`qwen3_5_text`, 64 layers, hidden size 5120, intermediate size 17408, dense
++SwiGLU, Gemma-style `1 + weight` RMSNorm and epsilon 1e-6. A checkpoint's name
++alone does not establish compatibility; binding validates its configuration.
++
++Unquantized BF16, TP1/2/4, PP1, and gfx1201 are required. LoRA, speculative
++execution, and context parallelism are unsupported. We assume the weights fit
++in VRAM. Stock vLLM retains attention/DeltaNet, KV/state caches, embeddings,
++input normalization and final normalization. Eligible mono decode has 1–16
++physical rows. This vLLM adapter still requires **`--enforce-eager`**.
++Standalone graph qualification is supplied; vLLM graph/Dynamo integration is
++not implemented. TP1 performs no peer communication, but the selected IPC
++mode can still fuse FFN layer scaling into its local epilogue.
++
++| Attention input | FFN reduction | Eligible FlyDSL decode | Fallback |
++|---|---|---|---|
++| `reduced` | `collective` | Local FFN, external FFN SUM | Stock layer |
++| `partial` | `collective` | In-kernel attention SUM and local FFN, external FFN SUM | Explicit attention SUM, then stock norm/MLP |
++| `reduced` | `ipc` | Local FFN and in-kernel FFN SUM | Stock layer |
++| `partial` | `ipc` | Both SUMs and FFN inside one kernel | Explicit attention SUM, then stock norm/MLP |
++
++Fallback rows, mixed/prefill metadata and unknown metadata are handled by the
++existing executor. Partial attention always requires this adapter on every
++forward; static refusal raises instead of passing unreduced attention to an
++unmodified layer. Ineligible steps do not enter either peer protocol. Both
++mailbox epochs advance once per eligible layer invocation, not per token.
+ 
+-## vLLM integration
++## TP layout and numerical boundaries
+ 
+-The source-checked installer targets vLLM commit
+-`d64414d044a898c6db646dcecd122213accd1732`. It preserves backups and refuses
+-unrecognized source anchors. Review the dry-run diff before applying:
++| TP | Local intermediate | Local W13 `[gate_local; up_local]` | Local W2 |
++|---|---:|---|---|
++| 1 | 17408 | `[34816, 5120]` | `[5120, 17408]` |
++| 2 | 8704 | `[17408, 5120]` | `[5120, 8704]` |
++| 4 | 4352 | `[8704, 5120]` | `[5120, 4352]` |
++
++Use vLLM's loaded shards directly. The test helper shards gate and up separately,
++then concatenates the local portions; a contiguous split of global W13 is wrong.
++
++For fused FFN reduction, each rank rounds its completed W2 result to BF16 before
++publication. Every rank reads those BF16 partials in TP-rank order, accumulates
++in FP32 and rounds the global SUM to BF16. Optional FFN scaling then applies
++BF16 `(1 + scale)` with BF16 output rounding. It is not applied before the SUM
++or repeated in the Python executor. The residual stays separate and replicated;
++it is neither summed across ranks nor added again in the FFN epilogue.
++
++FP32 rank-order accumulation can differ from stock RCCL's BF16 reduction tree,
++especially at TP4. The GPU harness compares against that explicit reference
++and reports TP1 differences separately. Compare loaded-model logits and quality;
++bitwise identity to stock RCCL is not promised.
++
++## Peer buffers and synchronization
++
++The FFN mailbox is separate from the attention mailbox. Both have independent
++READY/DONE/EPOCH/FAILED flags and independently exchanged pointer tables.
++Each has a 512-byte header and `16 * 5120 * 2 = 163840` payload bytes. The new
++allocation is **164352 bytes (160.5 KiB) per runner per GPU**, reused across
++layers, not allocated per layer. W2 stores directly into this mailbox, avoiding
++an extra copy kernel and separate intermediate W2-output buffer.
++
++Only owners write flags; remote GPUs read flags and data. Every W2 writer issues
++a system release fence before a local grid barrier. CTA0 publishes/waits READY,
++then a local barrier and system acquire precede peer reads. All readers retire
++before DONE. All ranks acknowledge DONE before the mailbox can be reused.
++The output collective is skipped only for FlyDSL with this specialization;
++the staged torch backend performs a reference FP32 collective instead.
++
++There are two compute grid barriers, four for fused attention if enabled, and
++four for fused FFN if enabled: **10 total with both reductions fused**.
++Live kernel residency is checked before launch. GPU failures are sticky and
++published to both active mailboxes; the model-forward fault collective remains.
++Unexpected rank failure or transport failure requires stopping the TP group.
++
++`QWEN38_IPC_ALLOCATOR=hipmalloc` uses exact-base `hipMalloc` export; the default
++remains `uncached`. Both must support the required peer visibility on your
++ROCm/driver/PCIe stack. Prior successful TP2 operation is useful evidence for
++that setup, but the new direct W2 publication phase needs GPU qualification.
++All ranks must reside on one host, use distinct GPUs, have directed peer access,
++and see every TP GPU. Allocation and IPC mode settings must agree across ranks.
++
++Keep the runner and weights alive while any graph references them. One runner
++is bound to one serialized stream. Do not overlap graphs sharing its workspace.
++Normal lifetime is until worker exit. For explicit teardown, destroy all such
++graphs, then call `runner.close_peers_collective()` on **every TP rank**. It
++retires FFN and attention imports before freeing their owner allocations.
++
++## Validation and qualification
++
++**61 host tests passed**. Actual FlyDSL 0.5.0 tracing, MLIR lowering and LLVM
++**gfx1201 ISA generation passed for 32 variants**, including 16 with FFN
++reduction. Python syntax and undefined-name checks passed. See `VALIDATION.json`,
++`validation/ffn_ipc_host_tests.txt`, and `validation/ffn_ipc_isa/compile_report.json`.
++Historical validation files are explicitly baseline evidence.
++
++No AMD GPU is available in the build environment. **ELF linking, GPU execution,
++peer memory ordering, numerical parity on GPU, live occupancy, graph replay,
++hardware fault injection, full-model quality and performance remain unverified.**
++The host protocol model assumes acquire/release visibility; it does not prove
++that hardware supplies it. See [FFN_REDUCTION.md](FFN_REDUCTION.md) for the
++implementation map and diagnostic sites.
++
++Run in your working ROCm environment, retaining its allocator/HSA settings:
+ 
+ ```bash
+-python install_vllm.py /path/to/vllm
+-python install_vllm.py /path/to/vllm --apply
++python compile_smoke.py
++# Or compiler-only ISA diagnostics without the ROCm linker:
++python compile_smoke.py --isa-only
++
++# First: TP2, small dimensions, both reductions and both scales.
++QWEN38_IPC_ALLOCATOR=hipmalloc \
++  torchrun --standalone --nproc-per-node=2 validate_tp.py \
++  --attention-partials --attention-scale --ffn-reduction ipc --ffn-scale --small
++
++# Then: actual dimensions, replay, independent epoch wrap, and faults.
++QWEN38_IPC_ALLOCATOR=hipmalloc \
++  torchrun --standalone --nproc-per-node=2 validate_tp.py \
++  --attention-partials --attention-scale --ffn-reduction ipc --ffn-scale \
++  --graph --fault-test
+ ```
+ 
+-The installer now also controls both Gated DeltaNet `out_proj` and full-attention
+-`o_proj` reduction through their constructors. It adds `.qwen38.v4.bak` backups,
+-leaving previous `.qwen38.bak` backups intact, and is idempotent. Re-run it even
+-if the earlier model-loop patch is already installed. Reinstall this package
+-into the environment imported by the worker and restart all workers.
+-First check the staged reference with `QWEN38_FFN_BACKEND=torch`. After GPU and
+-loaded-model qualification, select FlyDSL:
++Repeat with four processes for TP4. Also test `--ffn-reduction ipc` without
++`--attention-partials`/`--attention-scale`, and the old `--ffn-reduction collective`
++path without `--ffn-scale`. `validate.py` remains the original TP1 harness.
++The standalone TP validator uses explicit process groups and their host groups;
++serving uses vLLM's TP subgroup. CPU/Gloo subgroup qualification is available:
+ 
+ ```bash
+-QWEN38_SPECIALIZED_DECODE=1 QWEN38_ATTENTION_INPUT=partial \
+-QWEN38_FFN_BACKEND=flydsl \
+-  vllm serve /path/to/checkpoint --dtype bfloat16 \
+-  --tensor-parallel-size 2 --enforce-eager
++torchrun --standalone --nproc-per-node=4 validate_tp.py --cpu --small \
++  --attention-partials --attention-scale --ffn-reduction ipc --ffn-scale \
++  --tp-size=2 --fault-test
+ ```
+ 
+-Use `--tensor-parallel-size 4` for TP4 or `1` for TP1; no other TP-specific
+-environment setting is needed beyond the partial-input opt-in above. Set the specialized-decode enable/backend flags
+-consistently on every worker. The integration does not create process groups;
+-vLLM initializes and owns them.
+-
+-The backend defaults to `torch`. With `partial` selected, the adapter must run
+-on **every** forward. Unknown/mixed/prefill metadata and >16 rows use the explicit
+-fallback that restores attention SUM before stock norm/MLP. Disabling the adapter,
+-missing its model config, or refusing static support raises an error in partial
+-mode. Calling the original unmodified layer after disabling attention SUM would
+-be incorrect. Reduced mode retains the previous stock-layer fallback behavior.
+-
+-Use the supplied `QWEN38_ATTENTION_INPUT` setting, not a global “disable all
+-reduces” switch. Keep the MLP down-projection reduction enabled for fallback,
+-and keep other model collectives enabled. Binding checks attention projection
+-`reduce_results` and rejects attention output bias in partial mode. Every
+-worker must agree on settings before construction; do not change them mid-run. Compiler or occupancy failures are
+-errors, not silent fallbacks. `QWEN38_FFN_CACHE_DIR`, if set, selects the
+-process-wide `FLYDSL_RUNTIME_CACHE_DIR`; conflicting values are rejected.
+-
+-## Synchronization and performance contracts
+-
+-Each runner owns fixed-capacity scratch, control `[arrivals, generation]`, and
+-sticky fault `[failed, site, CTA, generation]` buffers. The two compute barriers,
+-plus four peer-phase grid barriers in partial TP2/4 mode, are device-owned
+-and advance across graph replays; uint32 wrap uses equality tests.
+-Every writing thread releases before arrival publication; every consuming
+-thread acquires after the CTA barrier. Inactive token loads are actually
+-predicated. Completed work stores each output only after the full K reduction.
+-
+-Peer synchronization uses owner-written uint32 READY, DONE, EPOCH, and FAILED
+-words on separate 128-byte boundaries. Every producer finishes system-visible
+-stores before READY. Every consumer retires its peer reads before DONE. All
+-ranks acknowledge DONE before a later epoch can overwrite the one-bank mailbox.
+-Equality comparisons plus this two-phase protocol permit uint32 wrap without
+-host resets. A per-runner epoch advances per **layer invocation**, including
+-replays, not merely per token. All ranks must enter the same layer order with
+-the same physical row count and branch decision. There is no per-step host
+-metadata consensus; mismatched participation is a job failure.
+-
+-Warmup compiles, queries residency, allocates state, and performs a no-access
+-`rows=0` launch to initialize the runtime before capture. The runner then binds
+-to one execution stream. Never overlap graphs that share its workspace. Keep
+-weights and runner alive, and rebuild after replacing weight storage. The
+-standalone graph test does not imply support for vLLM's graph infrastructure.
+-IPC memory has no destructor that could free storage while a graph references
+-it. Normally keep the runner/arena alive until worker exit. For explicit teardown,
+-destroy every referencing graph and call `runner.peer_arena.close_collective()`
+-on **all TP ranks**; it synchronizes, unmaps all imports, confirms retirement,
+-and only then frees owner allocations. Never call on just one rank.
+-
+-The spin limit is an iteration bound, not a wall-clock timeout. A barrier fault
+-is permanent: discard the step and stop the worker; there is no clear/resume
+-operation. Occupancy checks resource capacity, not exclusive scheduling under
+-competing processes. Qualify on an otherwise idle gfx1201 device.
+-
+-This implementation has no benchmark-selected tiling, weight preshuffle, or
+-explicit prefetch pipeline. It is not a demonstrated replacement for
+-hipBLASLt on performance. Measure 1/2/4/8/16-row FFNs and full decode latency
+-against the staged and stock paths, using the same eager-mode setting. Include
+-attention communication and the complete decoder layer in the measurement.
+-The mailbox copy, peer reads, six grid barriers, and system fences have real
+-costs. Saving a launch does not guarantee lower latency, especially on PCIe.
+-
+-## References
+-
+-- [FlyDSL v0.5.0](https://github.com/ROCm/FlyDSL/tree/v0.5.0)
+-- [Release RDNA4 WMMA test](https://github.com/ROCm/FlyDSL/blob/v0.5.0/tests/kernels/test_rdna4_integer_wmma_atom.py)
+-- [Release memory and atomic wrappers](https://github.com/ROCm/FlyDSL/blob/v0.5.0/python/flydsl/expr/llvm.py)
+-- [Release HIP host IPC wrapper](https://github.com/ROCm/FlyDSL/blob/v0.5.0/kernels/monokernel/ipc.py)
+-- [Release compiler and occupancy API](https://github.com/ROCm/FlyDSL/blob/v0.5.0/python/flydsl/compiler/jit_function.py)
+-- [Original implementation](https://github.com/juripero/Temp/tree/dfebe6d884eeb6912a6fca247755fc257f6097cc/specialized_decode)
+-- [MiniMax specialized-decode reference](https://github.com/vllm-project/vllm/tree/d64414d044a898c6db646dcecd122213accd1732/vllm/models/minimax_m3/amd/specialized_decode)
+-- [Qwen model integration reference](https://github.com/vllm-project/vllm/blob/d64414d044a898c6db646dcecd122213accd1732/vllm/model_executor/models/qwen3_5.py)
+-
+-- [vLLM TP collectives](https://github.com/vllm-project/vllm/blob/d64414d044a898c6db646dcecd122213accd1732/vllm/distributed/communication_op.py)
+-- [vLLM TP linear layers](https://github.com/vllm-project/vllm/blob/d64414d044a898c6db646dcecd122213accd1732/vllm/model_executor/layers/linear.py)
++This removes approximately one separate FFN collective launch per eligible
++layer, plus normally two pointwise launches if FFN layer scaling was enabled.
++It does not eliminate communication traffic. Additional barriers, fences and
++peer reads can outweigh launch savings; measure full decode latency against
++`ffn_reduction=collective` with identical eager-mode and batch settings.
++
++## Sources
++
++- [Reviewed package](https://github.com/juripero/Temp/tree/aeda0e48645ec0725927791e14f529dcd2930d56/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2)
++- [FlyDSL v0.5.0](https://github.com/ROCm/FlyDSL/tree/v0.5.0), commit `226cde8d2a84bc2687c8d69587607fddf0c16f2f`
++- [HIP IPC contract](https://rocm.docs.amd.com/projects/HIP/en/latest/reference/hip_runtime_api/modules/device_management.html)
++- [Pinned vLLM Qwen integration](https://github.com/vllm-project/vllm/blob/d64414d044a898c6db646dcecd122213accd1732/vllm/model_executor/models/qwen3_5.py)
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/VALIDATION.json b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/VALIDATION.json
+index 152dae5..dbeb5e9 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/VALIDATION.json
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/VALIDATION.json
+@@ -1,12 +1,7 @@
+ {
+-  "version": "0.4.2",
+-  "host_unit_tests_passed": 48,
+-  "syntax_compileall": "passed",
+-  "undefined_names_ruff_F821_F822_F823": "passed",
+-  "gpu_execution": false,
+-  "rccl_execution": false,
+-  "isa": "inherited unchanged GPU source",
+-  "source_commit": "efe05e2a28d35c844d34b52f20d3aebc349f5b9c",
++  "package_version": "0.4.3",
++  "reviewed_temp_commit": "aeda0e48645ec0725927791e14f529dcd2930d56",
++  "reviewed_directory": "qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2",
+   "vllm_integration_commit": "d64414d044a898c6db646dcecd122213accd1732",
+   "flydsl_version": "0.5.0",
+   "target": "gfx1201",
+@@ -15,11 +10,23 @@
+     2,
+     4
+   ],
+-  "gpu_hardware_available": false,
++  "host_unittest_cases_passed": 61,
++  "host_test_log": "validation/ffn_ipc_host_tests.txt",
++  "python_syntax": "passed",
++  "ruff_F821_F822_F823": "passed",
++  "isa_generation_variants": 32,
++  "isa_generation_new_ffn_variants": 16,
++  "isa_report": "validation/ffn_ipc_isa/compile_report.json",
++  "abstract_protocol": "Two independent banks over three invocation pairs, TP2/4, uint32 wrap; passed under acquire/release premise",
++  "elf_linking": "not tested",
++  "gpu_execution": "not tested: no AMD GPU available",
++  "real_distributed": "not rerun: prior Gloo attempts blocked at transport initialization",
++  "gpu_numerics_peer_ordering_graphs_faults": "not tested; validator extended",
++  "loaded_model_quality_performance": "not tested",
++  "new_option": "QWEN38_FFN_REDUCTION=ipc; default remains collective",
++  "allocator": "existing hipmalloc/uncached selection retained",
+   "vllm_enforce_eager_required": true,
+-  "real_distributed": "not run in this update",
+-  "current_isa_report": null,
+-  "gpu_numerics_graphs_performance": "not tested",
+-  "allocation_default": "uncached; hipmalloc is explicit opt-in",
+-  "exact_base_patch_applies_to_reviewed_commit": "passed"
++  "historical_evidence": "validation/isa, validation/baseline, validation/current_host_results.json are prior-version evidence",
++  "source_patch": "forward application to pristine reviewed commit passed; all Python files matched",
++  "python_source_count": 32
+ }
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/compile_smoke.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/compile_smoke.py
+index dc3c000..c1a531d 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/compile_smoke.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/compile_smoke.py
+@@ -43,16 +43,16 @@ def _objects(compiled):
+     return found[0]
+ 
+ 
+-def compile_one(hidden, intermediate, blocks, output, isa_only, tp=1, rank=0, partial=False):
+-    module = build_ffn(hidden, intermediate, blocks=blocks, tp=tp, rank=rank, attention_partial=partial)
++def compile_one(hidden, intermediate, blocks, output, isa_only, tp=1, rank=0, partial=False, ffn_reduce=False):
++    module = build_ffn(hidden, intermediate, blocks=blocks, tp=tp, rank=rank, attention_partial=partial, ffn_reduce=ffn_reduce)
+     if module.compiled._runtime_ready:
+         raise AssertionError("Placeholder compilation initialized a device runtime")
+     obj = _objects(module.compiled)
+     blob = obj.encode() if isinstance(obj, str) else bytes(obj)
+-    stem = f"h{hidden}_i{intermediate}_b{blocks}_tp{tp}r{rank}_a{int(partial)}"
++    stem = f"h{hidden}_i{intermediate}_b{blocks}_tp{tp}r{rank}_a{int(partial)}_f{int(ffn_reduce)}"
+     result = {"hidden": hidden, "intermediate": intermediate, "blocks": blocks,
+               "flydsl": "0.5.0", "target": "gfx1201", "executed_on_gpu": False,
+-              "tp_size": tp, "tp_rank": rank, "attention_partial": partial}
++              "tp_size": tp, "tp_rank": rank, "attention_partial": partial, "ffn_reduce": ffn_reduce}
+     if isa_only:
+         assembly = blob.decode()
+         for marker in ("gfx1201", "v_wmma_f32_16x16x16_bf16",
+@@ -60,7 +60,7 @@ def compile_one(hidden, intermediate, blocks, output, isa_only, tp=1, rank=0, pa
+                        "global_atomic_cmpswap_b32", "scope:SCOPE_DEV"):
+             if marker not in assembly:
+                 raise AssertionError(f"Missing ISA marker: {marker}")
+-        if partial and tp > 1 and "scope:SCOPE_SYS" not in assembly:
++        if (partial or ffn_reduce) and tp > 1 and "scope:SCOPE_SYS" not in assembly:
+             raise AssertionError("Missing system-scope peer ordering in ISA")
+         for key in ("next_free_vgpr", "next_free_sgpr", "group_segment_fixed_size",
+                     "private_segment_fixed_size"):
+@@ -93,13 +93,14 @@ def main():
+     os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "0"
+ 
+     def run():
+-        cases = [(h, global_i // tp, blocks, tp, rank, partial)
++        cases = [(h, global_i // tp, blocks, tp, rank, partial, ffn_reduce)
+                  for h, global_i, blocks in ((32, 64, 4), (5120, 17408, 64))
+                  for tp in (1, 2, 4)
+                  for partial in (False, True)
+-                 for rank in ((0, tp - 1) if partial and tp > 1 else (0,))]
+-        return [compile_one(h, i, b, args.output, args.isa_only, tp, rank, partial)
+-                for h, i, b, tp, rank, partial in cases]
++                 for ffn_reduce in ((False, True) if tp > 1 else (False,))
++                 for rank in ((0, tp - 1) if (partial or ffn_reduce) and tp > 1 else (0,))]
++        return [compile_one(h, i, b, args.output, args.isa_only, tp, rank, partial, ffn_reduce)
++                for h, i, b, tp, rank, partial, ffn_reduce in cases]
+ 
+     if args.isa_only:
+         from flydsl.compiler.backends.rocm import RocmBackend
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/pyproject.toml b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/pyproject.toml
+index f823b68..0f74c8f 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/pyproject.toml
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "qwen38-gfx1201-decode"
+-version = "0.4.2"
++version = "0.4.3"
+ description = "Qwen3.5-compatible 27B TP1/TP2/TP4 BF16 FlyDSL 0.5.0 attention SUM and FFN source and validation tools"
+ requires-python = ">=3.10"
+ dependencies = []
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/integration.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/integration.py
+index ed69bb9..6269a64 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/integration.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/integration.py
+@@ -36,6 +36,7 @@ def get_or_build_decode(inner):
+         decode_config = DecodeConfig(
+             tp_size=group.world_size, tp_rank=group.rank_in_group,
+             attention_input=os.environ.get("QWEN38_ATTENTION_INPUT", "reduced"),
++            ffn_reduction=os.environ.get("QWEN38_FFN_REDUCTION", "collective"),
+             backend=os.environ.get("QWEN38_FFN_BACKEND", "torch"),
+             cache_dir=os.environ.get("QWEN38_FFN_CACHE_DIR"),
+         )
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/_flydsl_kernel.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/_flydsl_kernel.py
+index f21a529..69cb255 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/_flydsl_kernel.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/_flydsl_kernel.py
+@@ -5,8 +5,9 @@ ASTRewriter helper boundary follows vLLM's specialized_decode reference.
+ Both are deliberately version-pinned; no HIP/C++ extension is generated.
+ 
+ The intermediate dimension is rank-local (I/TP). Residual inputs are replicated; attention is reduced through IPC in partial
+-mode. The output is this rank's BF16 down-projection partial; its SUM is
+-performed by the host runner through the TP collective.
++mode. With ffn_reduce enabled, W2 writes BF16 partials directly into a separate
++IPC mailbox, and a device epilogue produces the global SUM. Otherwise the
++host runner retains the output collective.
+ """
+ 
+ import flydsl.compiler as flyc
+@@ -67,7 +68,7 @@ def grid_barrier(control, fault, ok, tid, bid, blocks, max_spins, site):
+ 
+ 
+ @ASTRewriter.transform
+-def scaled_attention(value, col, scale, has_scale):
++def scaled_bf16(value, col, scale, has_scale):
+     if has_scale != 0:
+         # Stock semantics: BF16(scale), BF16(1 + scale), BF16(attention * factor).
+         factor = (fx.generic_load(scale + col).to(fx.Float32) + 1.0).to(fx.BFloat16).to(fx.Float32)
+@@ -98,7 +99,7 @@ def reduce_attention(a, reduced, peers, scale, has_scale, control, fault, ok,
+                     remote = data_ptr(fx.generic_load(peers + peer))
+                     total = total + fx.generic_load(remote + index).to(fx.Float32)
+                 value = total.to(fx.BFloat16).to(fx.Float32)
+-                value = scaled_attention(value, index % hidden, scale, has_scale)
++                value = scaled_bf16(value, index % hidden, scale, has_scale)
+                 fx.generic_store(reduced + index, value.to(fx.BFloat16))
+             # Retire every thread's peer reads before declaring DONE.
+             fx.memory_fence(syncscope=fx.SyncScope.System, ordering=fx.AtomicOrdering.AcqRel)
+@@ -112,22 +113,64 @@ def reduce_attention(a, reduced, peers, scale, has_scale, control, fault, ok,
+                 grid_barrier(control, fault, ok, tid, bid, blocks, max_spins, 6)
+ 
+ 
+-def make_launcher(hidden, intermediate, blocks, tp=1, rank=0, attention_partial=False):
++@ASTRewriter.transform
++def reduce_ffn(out, peers, scale, has_scale, control, fault, ok,
++               tid, bid, rows, hidden, blocks, max_spins, tp, rank):
++    """All W2 writers participate, including CTAs with no assigned output tiles.
++
++    W2 already wrote BF16 partials directly to this rank's FFN mailbox.
++    Four grid barriers establish publication, readiness, retirement and reuse.
++    FFN flags/epochs are disjoint from the attention mailbox.
++    """
++    own = fx.generic_load(peers + rank)
++    epoch = acquire(flag_ptr(own, EPOCH)) + fx.Uint32(1)
++    fx.memory_fence(syncscope=fx.SyncScope.System, ordering=fx.AtomicOrdering.Release)
++    grid_barrier(control, fault, ok, tid, bid, blocks, max_spins, 20)
++    if fx.ptr_load(ok) != 0:
++        if (bid == 0) & (tid == 0):
++            peer_phase(peers, own, epoch, fault, tp, READY, max_spins, 30)
++        grid_barrier(control, fault, ok, tid, bid, blocks, max_spins, 21)
++        fx.memory_fence(syncscope=fx.SyncScope.System, ordering=fx.AtomicOrdering.Acquire)
++        if fx.ptr_load(ok) != 0:
++            for index in range(bid * 128 + tid, rows * hidden, blocks * 128):
++                total = fx.Float32(0.0)
++                for peer in fx.range_constexpr(tp):
++                    remote = data_ptr(fx.generic_load(peers + peer))
++                    total = total + fx.generic_load(remote + index).to(fx.Float32)
++                # Preserve local BF16 W2 boundaries, then round the global sum.
++                value = total.to(fx.BFloat16).to(fx.Float32)
++                value = scaled_bf16(value, index % hidden, scale, has_scale)
++                fx.generic_store(out + index, value.to(fx.BFloat16))
++            fx.memory_fence(syncscope=fx.SyncScope.System, ordering=fx.AtomicOrdering.AcqRel)
++            grid_barrier(control, fault, ok, tid, bid, blocks, max_spins, 22)
++            if fx.ptr_load(ok) != 0:
++                if (bid == 0) & (tid == 0):
++                    peer_phase(peers, own, epoch, fault, tp, DONE, max_spins, 31)
++                    if fx.generic_load(fault, memory_order=fx.AtomicOrdering.Acquire,
++                                       syncscope="agent") == 0:
++                        release(flag_ptr(own, EPOCH), epoch)
++                grid_barrier(control, fault, ok, tid, bid, blocks, max_spins, 23)
++
++
++def make_launcher(hidden, intermediate, blocks, tp=1, rank=0, attention_partial=False, ffn_reduce=False):
+     peer_mode = attention_partial and tp > 1
++    ffn_peer_mode = ffn_reduce and tp > 1
+     @fx.struct
+     class Lds:
+         red: fx.Array[fx.Float32, 4, 4]
+         inv: fx.Array[fx.Float32, 1, 4]
+         ok: fx.Array[fx.Int32, 1, 4]
+ 
+-    @flyc.kernel(name=f"qwen_bf16_h{hidden}_i{intermediate}_b{blocks}_tp{tp}r{rank}_a{int(attention_partial)}",
++    @flyc.kernel(name=f"qwen_bf16_ffnar_v1_h{hidden}_i{intermediate}_b{blocks}_tp{tp}r{rank}_a{int(attention_partial)}_f{int(ffn_reduce)}",
+                  known_block_size=[128, 1, 1])
+     def ffn(a: fx.Pointer, residual: fx.Pointer, norm: fx.Pointer,
+             w13: fx.Pointer, w2: fx.Pointer, out: fx.Pointer,
+             resout: fx.Pointer, scratch: fx.Pointer, control: fx.Pointer,
+             fault: fx.Pointer, peers: fx.Pointer, attn_scale: fx.Pointer,
++            ffn_peers: fx.Pointer, ffn_scale: fx.Pointer,
+             rows: fx.Int32, eps: fx.Float32,
+-            max_spins: fx.Int32, drop_cta: fx.Int32, has_attn_scale: fx.Int32):
++            max_spins: fx.Int32, drop_cta: fx.Int32, has_attn_scale: fx.Int32,
++            has_ffn_scale: fx.Int32, drop_ffn_cta: fx.Int32):
+         # rows=0 is a no-dereference warmup launch to initialize the runtime.
+         if rows > 0:
+             tid = fx.thread_idx.x
+@@ -156,7 +199,7 @@ def make_launcher(hidden, intermediate, blocks, tp=1, rank=0, attention_partial=
+                             offset = row * hidden + col
+                             attention_value = fx.generic_load(attention + offset).to(fx.Float32)
+                             if fx.const_expr(not peer_mode):
+-                                attention_value = scaled_attention(attention_value, col, attn_scale, has_attn_scale)
++                                attention_value = scaled_bf16(attention_value, col, attn_scale, has_attn_scale)
+                             summed = attention_value + fx.generic_load(residual + offset).to(fx.Float32)
+                             fx.generic_store(resout + offset, summed.to(fx.BFloat16))
+                             ssq = ssq + summed * summed
+@@ -176,7 +219,7 @@ def make_launcher(hidden, intermediate, blocks, tp=1, rank=0, attention_partial=
+                             offset = row * hidden + col
+                             attention_value = fx.generic_load(attention + offset).to(fx.Float32)
+                             if fx.const_expr(not peer_mode):
+-                                attention_value = scaled_attention(attention_value, col, attn_scale, has_attn_scale)
++                                attention_value = scaled_bf16(attention_value, col, attn_scale, has_attn_scale)
+                             summed = attention_value + fx.generic_load(residual + offset).to(fx.Float32)
+                             scale = fx.generic_load(norm + col).to(fx.Float32) + 1.0
+                             fx.generic_store(xnorm + offset,
+@@ -216,6 +259,9 @@ def make_launcher(hidden, intermediate, blocks, tp=1, rank=0, attention_partial=
+                         grid_barrier(control, fault, lds.ok.ptr, tid, bid,
+                                      blocks, max_spins, 2)
+                         if fx.ptr_load(lds.ok.ptr) != 0:
++                            down_output = out
++                            if fx.const_expr(ffn_peer_mode):
++                                down_output = data_ptr(fx.generic_load(ffn_peers + rank))
+                             for tile in range(bid * 4 + wave, hidden // 16, blocks * 4):
+                                 acc = fx.Vector.filled(8, 0.0, fx.Float32)
+                                 for k in range(0, intermediate, 16):
+@@ -229,8 +275,17 @@ def make_launcher(hidden, intermediate, blocks, tp=1, rank=0, attention_partial=
+                                 if token < rows:
+                                     for j in fx.range_constexpr(8):
+                                         feature = tile * 16 + khalf + j
+-                                        fx.generic_store(out + token * hidden + feature,
+-                                                         acc[j].to(fx.BFloat16))
++                                        value = acc[j].to(fx.BFloat16).to(fx.Float32)
++                                        if fx.const_expr(not ffn_peer_mode):
++                                            value = scaled_bf16(value, feature, ffn_scale, has_ffn_scale)
++                                        fx.generic_store(down_output + token * hidden + feature,
++                                                         value.to(fx.BFloat16))
++                            if fx.const_expr(ffn_peer_mode):
++                                # Qualification-only fault: omit one CTA from the FFN publication barrier.
++                                if bid != drop_ffn_cta:
++                                    reduce_ffn(out, ffn_peers, ffn_scale, has_ffn_scale,
++                                               control, fault, lds.ok.ptr, tid, bid, rows,
++                                               hidden, blocks, max_spins, tp, rank)
+ 
+             if fx.const_expr(peer_mode):
+                 # Also publish local-grid failures when CTA0 was dropped.
+@@ -240,15 +295,26 @@ def make_launcher(hidden, intermediate, blocks, tp=1, rank=0, attention_partial=
+                     if failed != 0:
+                         release(flag_ptr(fx.generic_load(peers + rank), FAILED), fx.Uint32(1))
+ 
++            if fx.const_expr(ffn_peer_mode):
++                # Publish any attention/compute/FFN failure to FFN waiters as well.
++                if tid == 0:
++                    failed = fx.generic_load(fault, memory_order=fx.AtomicOrdering.Acquire,
++                                             syncscope="agent")
++                    if failed != 0:
++                        release(flag_ptr(fx.generic_load(ffn_peers + rank), FAILED), fx.Uint32(1))
++
+     @flyc.jit
+     def launch(a: fx.Pointer, residual: fx.Pointer, norm: fx.Pointer,
+                w13: fx.Pointer, w2: fx.Pointer, out: fx.Pointer,
+                resout: fx.Pointer, scratch: fx.Pointer, control: fx.Pointer,
+                fault: fx.Pointer, peers: fx.Pointer, attn_scale: fx.Pointer,
++            ffn_peers: fx.Pointer, ffn_scale: fx.Pointer,
+             rows: fx.Int32, eps: fx.Float32,
+-               max_spins: fx.Int32, drop_cta: fx.Int32, has_attn_scale: fx.Int32, stream: fx.Stream):
++               max_spins: fx.Int32, drop_cta: fx.Int32, has_attn_scale: fx.Int32,
++               has_ffn_scale: fx.Int32, drop_ffn_cta: fx.Int32, stream: fx.Stream):
+         ffn(a, residual, norm, w13, w2, out, resout, scratch, control,
+-            fault, peers, attn_scale, rows, eps, max_spins, drop_cta, has_attn_scale).launch(
++            fault, peers, attn_scale, ffn_peers, ffn_scale, rows, eps, max_spins, drop_cta,
++            has_attn_scale, has_ffn_scale, drop_ffn_cta).launch(
+                 grid=(blocks, 1, 1), block=(128, 1, 1), stream=stream)
+ 
+     return launch
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/a16w16.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/a16w16.py
+index 82cd0c9..5a0ab73 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/a16w16.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/a16w16.py
+@@ -33,7 +33,8 @@ class CompiledFfn:
+ 
+     @staticmethod
+     def arguments(addresses, rows, eps, max_spins, drop_cta, stream,
+-                  *, peers=0, attn_scale=0, has_attn_scale=0):
++                  *, peers=0, attn_scale=0, has_attn_scale=0,
++                  ffn_peers=0, ffn_scale=0, has_ffn_scale=0, drop_ffn_cta=-1):
+         import flydsl.compiler as flyc
+         import flydsl.expr as fx
+         # The last two pointers are uint32 arrival/generation and fault state.
+@@ -41,8 +42,11 @@ class CompiledFfn:
+                                   assumed_align=2 if i < 8 else 4)
+                 for i, address in enumerate(addresses)]
+         ptrs.extend((flyc.from_c_void_p(fx.Uint64, peers, assumed_align=8),
+-                     flyc.from_c_void_p(fx.BFloat16, attn_scale, assumed_align=2)))
+-        return (*ptrs, rows, eps, max_spins, drop_cta, has_attn_scale, fx.Stream(stream))
++                     flyc.from_c_void_p(fx.BFloat16, attn_scale, assumed_align=2),
++                     flyc.from_c_void_p(fx.Uint64, ffn_peers, assumed_align=8),
++                     flyc.from_c_void_p(fx.BFloat16, ffn_scale, assumed_align=2)))
++        return (*ptrs, rows, eps, max_spins, drop_cta, has_attn_scale,
++                has_ffn_scale, drop_ffn_cta, fx.Stream(stream))
+ 
+     def initialize_runtime(self, stream):
+         # Force load/ABI setup outside graph capture. rows=0 dereferences nothing.
+@@ -50,17 +54,19 @@ class CompiledFfn:
+ 
+     def ffn_launch(self, a, residual, norm, w13, w2, out, resout, scratch,
+                    control, fault, rows, eps, blocks, max_spins, drop_cta, stream,
+-                   *, peers=0, attn_scale=0, has_attn_scale=0):
++                   *, peers=0, attn_scale=0, has_attn_scale=0,
++                  ffn_peers=0, ffn_scale=0, has_ffn_scale=0, drop_ffn_cta=-1):
+         if blocks != self.blocks or not 1 <= rows <= 16:
+             raise ValueError("Launch geometry differs from the compiled specialization")
+         self.compiled(*self.arguments(
+             (a, residual, norm, w13, w2, out, resout, scratch, control, fault),
+             rows, eps, max_spins, drop_cta, stream, peers=peers,
+-            attn_scale=attn_scale, has_attn_scale=has_attn_scale))
++            attn_scale=attn_scale, has_attn_scale=has_attn_scale, ffn_peers=ffn_peers,
++            ffn_scale=ffn_scale, has_ffn_scale=has_ffn_scale, drop_ffn_cta=drop_ffn_cta))
+ 
+ 
+ def build_ffn(hidden, intermediate, cache_dir=None, *, blocks=64, tp=1, rank=0,
+-              attention_partial=False):
++              attention_partial=False, ffn_reduce=False):
+     if tp not in (1, 2, 4) or not 0 <= rank < tp:
+         raise ValueError("Invalid TP size/rank")
+     if any(d <= 0 or d % 16 for d in (hidden, intermediate)) or not 1 <= blocks <= 64:
+@@ -72,7 +78,7 @@ def build_ffn(hidden, intermediate, cache_dir=None, *, blocks=64, tp=1, rank=0,
+     target = current_target()
+     if target.arch != "gfx1201" or target.warp_size != 32:
+         raise RuntimeError(f"Wrong FlyDSL target: {target}")
+-    launcher = make_launcher(hidden, intermediate, blocks, tp, rank, attention_partial)
++    launcher = make_launcher(hidden, intermediate, blocks, tp, rank, attention_partial, ffn_reduce)
+     # Null typed pointers suppress compile()'s implicit launch and runtime init.
+     # The same path works on a CPU-only build host, without COMPILE_ONLY=1.
+     compiled = flyc.compile[{"fast_fp_math": False}](
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/runner.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/runner.py
+index 6a494ba..a4a3075 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/runner.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/mono/runner.py
+@@ -36,6 +36,7 @@ class FfnRunner:
+                                         or collective.rank != config.tp_rank):
+             raise ValueError("Collective group does not match the configured TP size/rank")
+         self.peer_arena = None
++        self.ffn_peer_arena = None
+         self.module = None
+         self.residency = None
+         self.scratch = None
+@@ -58,7 +59,8 @@ class FfnRunner:
+                                         self.config.local_intermediate_size,
+                                         self.config.cache_dir, blocks=self.config.blocks,
+                                         tp=self.config.tp_size, rank=self.config.tp_rank,
+-                                        attention_partial=self.config.attention_input == "partial")
++                                        attention_partial=self.config.attention_input == "partial",
++                                        ffn_reduce=self.config.fused_ffn_reduce)
+                 self.residency = checked_residency(self.module, self.config.blocks,
+                                                    torch.cuda.get_device_properties(self.device))
+                 count = scratch_bytes(MAX_ROWS, self.config.hidden_size,
+@@ -80,7 +82,7 @@ class FfnRunner:
+             self._warmup_local()
+         except Exception as exc:
+             error = f"{type(exc).__name__}: {exc}"
+-        peer_mode = self.config.fused_attention_reduce and self.config.backend == "flydsl"
++        peer_mode = (self.config.fused_attention_reduce or self.config.fused_ffn_reduce) and self.config.backend == "flydsl"
+         errors = ([error] if error else [])
+         if peer_mode:
+             errors = self.collective.setup_agreement(
+@@ -90,7 +92,11 @@ class FfnRunner:
+         if peer_mode:
+             from ..runtime.peer import PeerArena
+             with torch.cuda.device(self.device):
+-                self.peer_arena = PeerArena(self.device, self.config, self.collective)
++                if self.config.fused_attention_reduce:
++                    self.peer_arena = PeerArena(self.device, self.config, self.collective)
++                if self.config.fused_ffn_reduce:
++                    self.ffn_peer_arena = PeerArena(self.device, self.config, self.collective,
++                                                   purpose="ffn")
+         self._ready = True
+ 
+     def _check(self, layer, attn_out, residual):
+@@ -113,7 +119,7 @@ class FfnRunner:
+ 
+     @torch.no_grad()
+     def launch_layer(self, layer: LayerWeights, attn_out: torch.Tensor,
+-                     residual: torch.Tensor, *, attention_scale=None) -> tuple[torch.Tensor, torch.Tensor]:
++                     residual: torch.Tensor, *, attention_scale=None, ffn_scale=None) -> tuple[torch.Tensor, torch.Tensor]:
+         if not self._ready:
+             raise RuntimeError("Call runner.warmup() before launching")
+         rows = self._check(layer, attn_out, residual)
+@@ -124,6 +130,13 @@ class FfnRunner:
+             if attention_scale.device != self.device or attention_scale.numel() != self.config.hidden_size:
+                 raise ValueError("Attention scale device/shape mismatch")
+             scale = attention_scale.to(torch.bfloat16).reshape(-1).contiguous()
++        output_scale = None
++        if ffn_scale is not None:
++            if self.config.ffn_reduction != "ipc":
++                raise ValueError("Deferred FFN scale requires ffn_reduction=ipc")
++            if ffn_scale.device != self.device or ffn_scale.numel() != self.config.hidden_size:
++                raise ValueError("FFN scale device/shape mismatch")
++            output_scale = ffn_scale.to(torch.bfloat16).reshape(-1).contiguous()
+         context = torch.cuda.device(self.device) if self.device.type == "cuda" else nullcontext()
+         with context:
+             stream = self._bind_stream()
+@@ -138,9 +151,11 @@ class FfnRunner:
+                 out = torch.empty_like(attn_out)
+                 resout = torch.empty_like(residual)
+                 self._raw_launch(layer, attn_out, residual, out, resout, rows, stream,
+-                                 attention_scale=scale)
++                                 attention_scale=scale, ffn_scale=output_scale)
+             # Keep collective ordering inside the same device/stream context.
+             out = self._reduce_output(out)
++            if self.config.backend == "torch" and output_scale is not None:
++                out = out * (output_scale + 1)
+         return out, resout
+ 
+     def _bind_stream(self):
+@@ -156,10 +171,16 @@ class FfnRunner:
+     def _reduce_output(self, partial):
+         if self.config.tp_size == 1:
+             return partial
++        if self.config.fused_ffn_reduce:
++            if self.config.backend == "flydsl":
++                # The device epilogue already produced the global SUM.
++                return partial
++            # Staged numerical reference: BF16 local W2 -> FP32 SUM -> BF16.
++            return checked_sum(self.collective, partial.float()).bfloat16()
+         return checked_sum(self.collective, partial)
+ 
+     def _raw_launch(self, layer, a, residual, out, resout, rows, stream,
+-                    *, drop_cta=-1, max_spins=None, attention_scale=None):
++                    *, drop_cta=-1, drop_ffn_cta=-1, max_spins=None, attention_scale=None, ffn_scale=None):
+         """Internal entry used by fault-injection qualification, never fallback."""
+         self.module.ffn_launch(
+             a.data_ptr(), residual.data_ptr(), layer.post_norm.data_ptr(),
+@@ -171,8 +192,18 @@ class FfnRunner:
+             peers=self.peer_arena.table.data_ptr() if self.peer_arena is not None else 0,
+             attn_scale=attention_scale.data_ptr() if attention_scale is not None else 0,
+             has_attn_scale=int(attention_scale is not None),
++            ffn_peers=self.ffn_peer_arena.table.data_ptr() if self.ffn_peer_arena is not None else 0,
++            ffn_scale=ffn_scale.data_ptr() if ffn_scale is not None else 0,
++            has_ffn_scale=int(ffn_scale is not None), drop_ffn_cta=drop_ffn_cta,
+         )
+ 
++    def close_peers_collective(self):
++        """All ranks, after destroying referencing graphs; never a destructor."""
++        for arena in (self.ffn_peer_arena, self.peer_arena):
++            if arena is not None:
++                arena.close_collective()
++        self._ready = False
++
+     def collect_faults(self):
+         """Enqueue a group-wide fault SUM; every TP rank must participate."""
+         # One status SUM per integrated forward, including stock-only steps.
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/decode.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/decode.py
+index 703201c..e1f32b9 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/decode.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/decode.py
+@@ -66,8 +66,9 @@ class SpecializedDecode:
+             raise RuntimeError("Specialized FFN warmup failed: " + "; ".join(errors))
+         self.executor = FfnExecutor(self.model.layers, weights, self.runner)
+         self.enabled = True
+-        logger.info("Qwen specialized FFN backend=%s TP=%d rank=%d rows<=%d",
+-                    self.config.backend, self.config.tp_size, self.config.tp_rank, self.config.max_rows)
++        logger.info("Qwen specialized FFN backend=%s TP=%d rank=%d rows<=%d ffn_reduction=%s",
++                    self.config.backend, self.config.tp_size, self.config.tp_rank, self.config.max_rows,
++                    self.config.ffn_reduction)
+ 
+     def plan(self, positions, intermediate_tensors=None, *, metadata=None,
+              graph_mode="NONE"):
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/executor.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/executor.py
+index 83da2ee..fe29c99 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/executor.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/executor.py
+@@ -50,14 +50,17 @@ class FfnExecutor:
+         else:
+             raise ValueError(f"Unsupported layer type {layer.layer_type}")
+         scale = layer.attn_layer_scale if getattr(layer, "layer_scale", False) else None
++        deferred_ffn_scale = active and self.runner.config.ffn_reduction == "ipc"
++        ffn_scale = (layer.ffn_layer_scale if deferred_ffn_scale and
++                     getattr(layer, "layer_scale", False) else None)
+         if active:
+             if partial_attention:
+                 hidden_states, residual = self.runner.launch_layer(
+-                    self.weights[index], part, residual, attention_scale=scale)
++                    self.weights[index], part, residual, attention_scale=scale, ffn_scale=ffn_scale)
+             else:
+                 if scale is not None:
+                     part = self._scale(part, scale)
+-                hidden_states, residual = self.runner.launch_layer(self.weights[index], part, residual)
++                hidden_states, residual = self.runner.launch_layer(self.weights[index], part, residual, ffn_scale=ffn_scale)
+         else:
+             # Prefill, large batches, and unrecognized decode metadata: restore
+             # the deferred attention SUM before invoking stock norm and MLP.
+@@ -67,6 +70,6 @@ class FfnExecutor:
+                 part = self._scale(part, scale)
+             hidden_states, residual = layer.post_attention_layernorm(part, residual)
+             hidden_states = layer.mlp(hidden_states)
+-        if getattr(layer, "layer_scale", False):
++        if getattr(layer, "layer_scale", False) and not deferred_ffn_scale:
+             hidden_states = self._scale(hidden_states, layer.ffn_layer_scale)
+         return hidden_states, residual
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/peer.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/peer.py
+index 1e33a81..1d75979 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/peer.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/peer.py
+@@ -18,26 +18,29 @@ from ..mono.peer_layout import arena_bytes
+ from ..mono.peer_layout import READY, DONE, EPOCH
+ 
+ 
+-def validate_topology(records, tp, size):
++def validate_topology(records, tp, size, purpose="attention"):
+     if len(records) != tp or sorted(r["rank"] for r in records) != list(range(tp)):
+         raise RuntimeError("IPC bootstrap has inconsistent TP membership")
+     if any(r.get("error") for r in records):
+         raise RuntimeError("IPC allocation failed: " + "; ".join(
+             f"rank {r['rank']}: {r['error']}" for r in records if r.get("error")))
++    if any(r.get("purpose", "attention") != purpose for r in records):
++        raise RuntimeError("IPC ranks disagree on mailbox purpose/order")
+     if len({r.get("allocator", "uncached") for r in records}) != 1:
+         raise RuntimeError("TP ranks disagree on QWEN38_IPC_ALLOCATOR")
+     if len({r.get("ipc_mode", "<unset>") for r in records}) != 1:
+         raise RuntimeError("TP ranks have different HSA_ENABLE_IPC_MODE_LEGACY settings; restart all ranks with the same launch environment")
+     if any(r["host"] != records[0]["host"] for r in records):
+-        raise RuntimeError("Fused attention IPC requires all TP ranks on the same host")
++        raise RuntimeError("Fused decode IPC requires all TP ranks on the same host")
+     if len({r["bus"] for r in records}) != tp:
+-        raise RuntimeError("Fused attention IPC requires distinct GPUs")
++        raise RuntimeError("Fused decode IPC requires distinct GPUs")
+     if any(r["size"] != size or r["protocol"] != 1 or len(r["handle"]) != 64 for r in records):
+         raise RuntimeError("IPC mailbox layout or handle mismatch")
+ 
+ 
+ class PeerArena:
+-    def __init__(self, device, config, collective):
++    def __init__(self, device, config, collective, *, purpose="attention"):
++        self.purpose = purpose
+         self.device = torch.device(device)
+         if self.device.type != "cuda":
+             raise ValueError("PeerArena requires a ROCm CUDA device")
+@@ -52,12 +55,14 @@ class PeerArena:
+         if config.tp_size not in (2, 4):
+             raise ValueError("PeerArena requires TP2 or TP4")
+         self.size = arena_bytes(config.hidden_size)
+-        record = {"rank": config.tp_rank, "size": self.size, "protocol": 1, "error": None,
++        record = {"purpose": purpose, "rank": config.tp_rank, "size": self.size, "protocol": 1, "error": None,
+                   "ipc_mode": os.environ.get("HSA_ENABLE_IPC_MODE_LEGACY", "<unset>")}
+         phase = "runtime setup"
+         self.allocator = os.environ.get("QWEN38_IPC_ALLOCATOR", "uncached")
+         record["allocator"] = self.allocator
+         try:
++            if purpose not in ("attention", "ffn"):
++                raise ValueError("Unknown IPC mailbox purpose")
+             if self.allocator not in ("hipmalloc", "uncached"):
+                 raise ValueError("QWEN38_IPC_ALLOCATOR must be hipmalloc or uncached")
+             self.runtime = HipRuntime()
+@@ -93,7 +98,7 @@ class PeerArena:
+             record["error"] = f"{phase}: {type(exc).__name__}: {exc}"
+         records = collective.gather_host(record)
+         try:
+-            validate_topology(records, config.tp_size, self.size)
++            validate_topology(records, config.tp_size, self.size, purpose)
+         except Exception as bootstrap_error:
+             if self.own:
+                 try:
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/spec.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/spec.py
+index 70a3acf..527f12a 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/spec.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/specialized_decode/runtime/spec.py
+@@ -25,6 +25,7 @@ class DecodeConfig:
+     intermediate_size: int = INTERMEDIATE_SIZE
+     num_layers: int = NUM_LAYERS
+     attention_input: str = "reduced"
++    ffn_reduction: str = "collective"
+     tp_size: int = 1
+     tp_rank: int = 0
+     eps: float = 1e-6
+@@ -40,11 +41,17 @@ class DecodeConfig:
+     def fused_attention_reduce(self):
+         return self.attention_input == "partial" and self.tp_size > 1
+ 
++    @property
++    def fused_ffn_reduce(self):
++        return self.ffn_reduction == "ipc" and self.tp_size > 1
++
+     @property
+     def grid_barriers_per_launch(self):
+-        return 6 if self.fused_attention_reduce else 2
++        return 2 + 4 * int(self.fused_attention_reduce) + 4 * int(self.fused_ffn_reduce)
+ 
+     def __post_init__(self):
++        if self.ffn_reduction not in ("collective", "ipc"):
++            raise ValueError("ffn_reduction must be collective or ipc")
+         if self.attention_input not in ("reduced", "partial"):
+             raise ValueError("attention_input must be reduced or partial")
+         if self.tp_size not in (1, 2, 4) or not 0 <= self.tp_rank < self.tp_size:
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_attention_reduce.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_attention_reduce.py
+index 12e3899..a27d4f3 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_attention_reduce.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_attention_reduce.py
+@@ -46,11 +46,11 @@ class ReducedMLP(nn.Module):
+ 
+ 
+ class AttentionReduceTests(unittest.TestCase):
+-    def simulate(self, tp):
++    def simulate(self, tp, ffn_reduction="collective"):
+         torch.manual_seed(622)
+         torch.set_num_threads(1)
+         base = DecodeConfig(hidden_size=32, intermediate_size=64, num_layers=1,
+-                            attention_input="partial")
++                            attention_input="partial", ffn_reduction=ffn_reduction)
+         for kind in ("linear_attention", "full_attention"):
+             template = Layer(kind, base, scale=True)
+             full = LayerWeights(0, template.post_attention_layernorm.weight,
+@@ -109,6 +109,15 @@ class AttentionReduceTests(unittest.TestCase):
+     def test_tp4_decode_and_prefill_scale_order_and_single_residual(self):
+         self.simulate(4)
+ 
++    def test_tp1_ipc_mode_defers_ffn_scale_without_collective(self):
++        self.simulate(1, "ipc")
++
++    def test_tp2_ipc_ffn_decode_and_prefill_scale_order(self):
++        self.simulate(2, "ipc")
++
++    def test_tp4_ipc_ffn_decode_and_prefill_scale_order(self):
++        self.simulate(4, "ipc")
++
+     def test_partial_mode_requires_installed_enabled_adapter(self):
+         with patch.dict("os.environ", {"QWEN38_ATTENTION_INPUT": "partial", "QWEN38_SPECIALIZED_DECODE": "0"}):
+             with self.assertRaisesRegex(RuntimeError, "requires"):
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_flydsl_contract.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_flydsl_contract.py
+index b6b7977..6145470 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_flydsl_contract.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_flydsl_contract.py
+@@ -48,9 +48,9 @@ class FlyDslContractTests(unittest.TestCase):
+     def test_compile_arguments_are_null_placeholders_with_dynamic_scalars(self):
+         from flydsl.compiler.jit_function import _is_compile_placeholder
+         args = CompiledFfn.arguments([0] * 10, 0, 1e-6, 1, -1, None)
+-        self.assertEqual(len(args), 18)
+-        self.assertTrue(all(_is_compile_placeholder(p) for p in args[:12]))
+-        self.assertEqual(args[12:17], (0, 1e-6, 1, -1, 0))
++        self.assertEqual(len(args), 22)
++        self.assertTrue(all(_is_compile_placeholder(p) for p in args[:14]))
++        self.assertEqual(args[14:21], (0, 1e-6, 1, -1, 0, 0, -1))
+         self.assertIsNone(args[-1].value)
+ 
+ 
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_tp_simulation.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_tp_simulation.py
+index 0473ba4..35e8913 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_tp_simulation.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_tp_simulation.py
+@@ -51,7 +51,7 @@ class SimulatedRank:
+ 
+ 
+ class TpSimulationTests(unittest.TestCase):
+-    def simulate(self, tp, groups):
++    def simulate(self, tp, groups, ffn_reduction="collective"):
+         torch.set_num_threads(1)
+         tasks = []
+         for group_id in range(groups):
+@@ -73,7 +73,7 @@ class TpSimulationTests(unittest.TestCase):
+             group = SimulatedSumGroup(tp)
+             for rank in range(tp):
+                 config = DecodeConfig(hidden_size=32, intermediate_size=64, num_layers=1,
+-                                      tp_size=tp, tp_rank=rank)
++                                      tp_size=tp, tp_rank=rank, ffn_reduction=ffn_reduction)
+                 runner = FfnRunner("cpu", config, SimulatedRank(group, rank))
+                 runner.warmup()
+                 tasks.append((runner, local[rank], samples))
+@@ -103,6 +103,15 @@ class TpSimulationTests(unittest.TestCase):
+     def test_tp4_all_widths_sum_residual_and_faults(self):
+         self.simulate(4, 1)
+ 
++    def test_tp2_ipc_ffn_with_already_reduced_attention(self):
++        self.simulate(2, 1, "ipc")
++
++    def test_tp4_ipc_ffn_with_already_reduced_attention(self):
++        self.simulate(4, 1, "ipc")
++
++    def test_ipc_ffn_subgroups_do_not_mix_results(self):
++        self.simulate(2, 2, "ipc")
++
+     def test_two_independent_tp2_groups_do_not_mix_results(self):
+         self.simulate(2, 2)
+ 
+diff --git a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/validate_tp.py b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/validate_tp.py
+index 4ddd797..73c1f42 100644
+--- a/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/validate_tp.py
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/validate_tp.py
+@@ -62,7 +62,7 @@ def run(args):
+     h, inter = (32, 64) if args.small else (5120, 17408)
+     config = DecodeConfig(backend="torch" if args.cpu else "flydsl", hidden_size=h,
+                           intermediate_size=inter, num_layers=1, tp_size=tp, tp_rank=rank,
+-                          blocks=args.blocks,
++                          blocks=args.blocks, ffn_reduction=args.ffn_reduction,
+                           attention_input="partial" if args.attention_partials else "reduced")
+     errors = collective.setup_agreement(setup_signature(config), None)
+     if errors:
+@@ -89,6 +89,7 @@ def run(args):
+         torch.cuda.synchronize(device)
+     records = []
+     scale = rand((1, 1, h), .125) if args.attention_scale else None
++    ffn_scale = rand((1, 1, h), .125) if args.ffn_scale else None
+ 
+     def local_attention(rows):
+         value = rand((rows, h))
+@@ -101,6 +102,18 @@ def run(args):
+         dist.all_gather(partials, value, group=group)
+         return attention_sum_reference(partials, scale)
+ 
++    def scale_ffn(value):
++        if ffn_scale is not None:
++            value = value * (ffn_scale.bfloat16().reshape(-1) + 1)
++        return value
++
++    def expected_ffn(value):
++        if config.fused_ffn_reduce:
++            parts = [torch.empty_like(value) for _ in range(tp)]
++            dist.all_gather(parts, value, group=group)
++            return attention_sum_reference(parts, ffn_scale)
++        return scale_ffn(collective.all_reduce(value))
++
+     def compare(name, actual, expected, *, exact=False):
+         torch.testing.assert_close(actual, expected, atol=0 if exact else args.atol,
+                                    rtol=0 if exact else args.rtol, equal_nan=True)
+@@ -114,9 +127,10 @@ def run(args):
+             attention = reduced_attention(a)
+             partial, expected_res, expected_x, expected_mid = reference_ffn(
+                 attention, residual, local, return_stages=True)
+-            expected_tp = collective.all_reduce(partial)
++            expected_tp = expected_ffn(partial)
+             expected_tp1, _ = reference_ffn(attention, residual, full)
+-            actual, resout = runner.launch_layer(local, a, residual, attention_scale=scale)
++            expected_tp1 = scale_ffn(expected_tp1)
++            actual, resout = runner.launch_layer(local, a, residual, attention_scale=scale, ffn_scale=ffn_scale)
+             runner.check_health()  # Same collective order on every rank.
+             if stream is not None:
+                 stream.synchronize()
+@@ -139,32 +153,38 @@ def run(args):
+ 
+         if not args.cpu:
+             runner.control[1].fill_(-config.grid_barriers_per_launch)
+-            actual, resout = runner.launch_layer(local, a, residual, attention_scale=scale)
++            actual, resout = runner.launch_layer(local, a, residual, attention_scale=scale, ffn_scale=ffn_scale)
+             runner.check_health()
+             stream.synchronize()
+             if runner.control.tolist() != [0, 0]:
+                 raise AssertionError("Device generation did not wrap")
+             compare("generation-wrap", actual, expected_tp)
+-            if runner.peer_arena is not None:
+-                runner.peer_arena.debug_seed_epoch_collective(0xFFFFFFFE)
+-                for expected_epoch in (0xFFFFFFFF, 0, 1):
+-                    actual, _ = runner.launch_layer(local, a, residual, attention_scale=scale)
+-                    runner.check_health()
+-                    stream.synchronize()
+-                    if runner.peer_arena.debug_epoch() != expected_epoch:
+-                        raise AssertionError("Peer epoch did not wrap")
+-                    compare(f"peer-wrap/{expected_epoch}", actual, expected_tp)
++            # Different seeds catch accidental aliasing between the two mailboxes.
++            arenas = [("attention", runner.peer_arena, 0xFFFFFFFE),
++                      ("ffn", runner.ffn_peer_arena, 0xFFFFFFFD)]
++            for name, arena, seed in arenas:
++                if arena is not None:
++                    arena.debug_seed_epoch_collective(seed)
++            for step in range(1, 5):
++                actual, _ = runner.launch_layer(local, a, residual, attention_scale=scale,
++                                                ffn_scale=ffn_scale)
++                runner.check_health()
++                stream.synchronize()
++                for name, arena, seed in arenas:
++                    if arena is not None and arena.debug_epoch() != (seed + step) % 2**32:
++                        raise AssertionError(f"{name} peer epoch did not advance/wrap independently")
++                compare(f"peer-wrap/{step}", actual, expected_tp)
+ 
+         if args.graph:
+             a, residual = local_attention(8), rand((8, h))
+             for _ in range(3):
+-                runner.launch_layer(local, a, residual, attention_scale=scale)
++                runner.launch_layer(local, a, residual, attention_scale=scale, ffn_scale=ffn_scale)
+                 runner.check_health()
+             stream.synchronize()
+             dist.barrier(group=group)
+             graph = torch.cuda.CUDAGraph()
+             with torch.cuda.graph(graph, stream=stream):
+-                graph_out, graph_res = runner.launch_layer(local, a, residual, attention_scale=scale)
++                graph_out, graph_res = runner.launch_layer(local, a, residual, attention_scale=scale, ffn_scale=ffn_scale)
+                 runner.check_health()
+             for iteration in range(16):
+                 valid = 1 + iteration % 8
+@@ -174,7 +194,7 @@ def run(args):
+                 residual[valid:].fill_(float("nan"))
+                 attention = reduced_attention(a[:valid])
+                 partial, expected_res = reference_ffn(attention, residual[:valid], local)
+-                expected_tp = collective.all_reduce(partial)
++                expected_tp = expected_ffn(partial)
+                 graph.replay()
+                 stream.synchronize()
+                 compare(f"graph/{iteration}", graph_out[:valid], expected_tp)
+@@ -183,32 +203,38 @@ def run(args):
+         if args.fault_test:
+             if args.blocks < 2:
+                 raise ValueError("Fault injection requires blocks>=2")
+-            bad = FfnRunner(device, config, collective)
+-            bad.warmup()
+-            if args.cpu:
+-                if rank == 0:
+-                    bad.abort()
+-            elif rank == 0 or config.fused_attention_reduce:
+-                a = torch.zeros((1, h), device=device, dtype=torch.bfloat16)
+-                out, resout = torch.empty_like(a), torch.empty_like(a)
+-                bad._raw_launch(local, a, a, out, resout, 1, stream.cuda_stream,
+-                                drop_cta=0 if rank == 0 else -1, max_spins=10000)
+-            # Use the same propagation as production without triggering the
+-            # deliberate device assertion and poisoning the test context.
+-            bad.collect_faults()
+-            if stream is not None:
+-                stream.synchronize()
+-            first = bad.health()
+-            if first[0] != 1 or (not args.cpu and rank == 0 and first[1] != (3 if config.fused_attention_reduce else 1)):
+-                raise AssertionError(f"TP fault did not propagate: {first}")
+-            bad.collect_faults()
+-            if bad.health() != first:
+-                raise AssertionError("TP fault was not sticky")
+-            records.append({"test": "rank-0-fault-propagated-to-all-ranks", "passed": True})
++            for stage in (("entry", "ffn") if config.fused_ffn_reduce else ("entry",)):
++                bad = FfnRunner(device, config, collective)
++                bad.warmup()
++                if args.cpu:
++                    if rank == 0:
++                        bad.abort()
++                elif rank == 0 or config.fused_attention_reduce or config.fused_ffn_reduce:
++                    zero = torch.zeros((1, h), device=device, dtype=torch.bfloat16)
++                    out, resout = torch.empty_like(zero), torch.empty_like(zero)
++                    bad._raw_launch(local, zero, zero, out, resout, 1, stream.cuda_stream,
++                                    drop_cta=0 if rank == 0 and stage == "entry" else -1,
++                                    drop_ffn_cta=0 if rank == 0 and stage == "ffn" else -1,
++                                    max_spins=10000)
++                # Production propagation without deliberately poisoning the context.
++                bad.collect_faults()
++                if stream is not None:
++                    stream.synchronize()
++                first = bad.health()
++                expected_site = 20 if stage == "ffn" else (3 if config.fused_attention_reduce else 1)
++                if first[0] != 1 or (not args.cpu and rank == 0 and first[1] != expected_site):
++                    raise AssertionError(f"TP {stage} fault did not propagate: {first}")
++                bad.collect_faults()
++                if bad.health() != first:
++                    raise AssertionError("TP fault was not sticky")
++                records.append({"test": f"rank-0-{stage}-fault-propagated-to-all-ranks", "passed": True})
++                # All launched work is complete and no graphs reference this bad runner.
++                bad.close_peers_collective()
+ 
+     report = {"global_rank": global_rank, "tp_rank": rank, "tp_size": tp,
+               "group": group_id, "backend": config.backend, "collective": backend,
+               "attention_input": config.attention_input, "attention_scale": args.attention_scale,
++              "ffn_reduction": config.ffn_reduction, "ffn_scale": args.ffn_scale,
+               "local_w13": list(local.w13.shape), "local_w2": list(local.w2.shape),
+               "checks_passed": len(records), "measurements": records}
+     if args.report_dir:
+@@ -225,6 +251,8 @@ def main():
+     parser.add_argument("--cpu", action="store_true")
+     parser.add_argument("--attention-partials", action="store_true")
+     parser.add_argument("--attention-scale", action="store_true")
++    parser.add_argument("--ffn-reduction", choices=("collective", "ipc"), default="collective")
++    parser.add_argument("--ffn-scale", action="store_true")
+     parser.add_argument("--small", action="store_true")
+     parser.add_argument("--graph", action="store_true")
+     parser.add_argument("--fault-test", action="store_true")
+@@ -237,6 +265,8 @@ def main():
+     args = parser.parse_args()
+     if args.attention_scale and not args.attention_partials:
+         parser.error("--attention-scale requires --attention-partials")
++    if args.ffn_scale and args.ffn_reduction != "ipc":
++        parser.error("--ffn-scale requires --ffn-reduction ipc")
+     try:
+         run(args)
+     finally:
+--- /dev/null
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/tests/test_ffn_reduce.py
+@@ -0,0 +1,133 @@
++"""Host routing and abstract protocol checks, not GPU coherence validation."""
++from dataclasses import replace
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++import torch
++
++from specialized_decode.mono.runner import FfnRunner
++from specialized_decode.runtime.parallel import setup_signature, _check_agreement
++from specialized_decode.runtime.peer import validate_topology
++from specialized_decode.runtime.spec import DecodeConfig
++
++
++class FfnReductionTests(unittest.TestCase):
++    def config(self, **kw):
++        return DecodeConfig(hidden_size=32, intermediate_size=64, num_layers=1,
++                            tp_size=2, ffn_reduction="ipc", **kw)
++
++    def test_flydsl_result_is_not_reduced_or_scaled_again_on_host(self):
++        def forbidden(*args):
++            self.fail("Fused FFN output must not enter another collective")
++        collective = SimpleNamespace(world_size=2, rank=0, all_reduce=forbidden)
++        runner = FfnRunner("cpu", self.config(), collective)
++        runner.warmup()
++        runner.config = replace(runner.config, backend="flydsl")
++        a, residual = torch.ones(3, 32).bfloat16(), torch.full((3, 32), 7).bfloat16()
++        scale = torch.full((1, 1, 32), .5).bfloat16()
++        def device_epilogue(layer, attention, res, out, resout, rows, stream, **kw):
++            self.assertIsNotNone(kw["ffn_scale"])
++            out.fill_(6)  # Pretend kernel has produced the final global/scaled output.
++            resout.copy_(res)
++        with patch.object(runner, "_check", return_value=3), \
++             patch.object(runner, "_raw_launch", side_effect=device_epilogue) as launch:
++            out, res = runner.launch_layer(None, a, residual, ffn_scale=scale)
++        self.assertEqual(launch.call_count, 1)
++        torch.testing.assert_close(out, torch.full_like(out, 6), atol=0, rtol=0)
++        torch.testing.assert_close(res, residual, atol=0, rtol=0)
++
++    def test_torch_reference_reduces_fp32_but_old_mode_still_reduces_bf16(self):
++        calls = []
++        collective = SimpleNamespace(world_size=2, rank=0,
++                                     all_reduce=lambda x: calls.append(x.dtype) or x * 2)
++        runner = FfnRunner("cpu", self.config(), collective)
++        value = torch.ones(3, 32, dtype=torch.bfloat16)
++        torch.testing.assert_close(runner._reduce_output(value), value * 2, atol=0, rtol=0)
++        runner.config = replace(runner.config, ffn_reduction="collective")
++        runner._reduce_output(value)
++        self.assertEqual(calls, [torch.float32, torch.bfloat16])
++
++    def test_no_reduction_in_tp1(self):
++        runner = FfnRunner("cpu", DecodeConfig(ffn_reduction="ipc"))
++        value = torch.ones(1, 5120, dtype=torch.bfloat16)
++        self.assertIs(runner._reduce_output(value), value)
++        self.assertFalse(runner.config.fused_ffn_reduce)
++
++    def test_config_and_generation_account_for_both_peer_phases(self):
++        self.assertEqual(self.config().grid_barriers_per_launch, 6)
++        self.assertEqual(self.config(attention_input="partial").grid_barriers_per_launch, 10)
++        self.assertEqual(replace(self.config(), ffn_reduction="collective").grid_barriers_per_launch, 2)
++        with self.assertRaises(ValueError):
++            DecodeConfig(ffn_reduction="rccl")
++        signatures = [setup_signature(self.config()),
++                      setup_signature(replace(self.config(), ffn_reduction="collective"))]
++        records = [dict(rank=r, signature=s, error=None) for r, s in enumerate(signatures)]
++        with self.assertRaisesRegex(RuntimeError, "disagree"):
++            _check_agreement(records, 2)
++
++    def test_mailbox_roles_cannot_be_exchanged(self):
++        records = [dict(rank=r, error=None, purpose=p) for r,p in enumerate(("attention", "ffn"))]
++        with self.assertRaisesRegex(RuntimeError, "purpose"):
++            validate_topology(records, 2, 164352, "ffn")
++
++    def test_explicit_retirement_closes_both_mailboxes(self):
++        calls = []
++        runner = FfnRunner("cpu", DecodeConfig())
++        runner.warmup()
++        runner.peer_arena = SimpleNamespace(close_collective=lambda: calls.append("attention"))
++        runner.ffn_peer_arena = SimpleNamespace(close_collective=lambda: calls.append("ffn"))
++        runner.close_peers_collective()
++        self.assertEqual(calls, ["ffn", "attention"])
++        self.assertFalse(runner._ready)
++
++    def test_two_mailbox_interleavings_through_independent_epoch_wrap(self):
++        # Sequential attention/FFN phases over three invocations. Each bank has
++        # independent READY/DONE flags. Assumes acquire/release visibility.
++        for tp in (2, 4):
++            seen, stack, completed = set(), [tuple((0, 0) for _ in range(tp))], 0
++            seeds = (0xFFFFFFFE, 0xFFFFFFFD)
++            def counter(step, phase, bank, threshold):
++                count = (step + 1 - bank) // 2
++                count += int(step < 6 and step % 2 == bank and phase >= threshold)
++                return (seeds[bank] + count) & 0xFFFFFFFF
++            while stack:
++                state = stack.pop()
++                if state in seen:
++                    continue
++                seen.add(state)
++                if all(step == 6 for step, _ in state):
++                    completed += 1
++                    continue
++                choices = 0
++                for rank, (step, phase) in enumerate(state):
++                    if step == 6:
++                        continue
++                    bank = step % 2
++                    epoch = (seeds[bank] + step // 2 + 1) & 0xFFFFFFFF
++                    ready = [counter(s,p,bank,1) for s,p in state]
++                    done = [counter(s,p,bank,3) for s,p in state]
++                    if phase == 0:
++                        self.assertFalse(any(s < step and s % 2 == bank and p == 2 for s,p in state))
++                        nxt = (step, 1)
++                    elif phase == 1:
++                        if not all(v == epoch for v in ready):
++                            continue
++                        nxt = (step, 2)
++                    elif phase == 2:
++                        # No owner has recycled this bank while readers are active.
++                        self.assertEqual(ready, [epoch] * tp)
++                        nxt = (step, 3)
++                    else:
++                        if not all(v == epoch for v in done):
++                            continue
++                        nxt = (step + 1, 0)
++                    choices += 1
++                    next_state = list(state)
++                    next_state[rank] = nxt
++                    stack.append(tuple(next_state))
++                self.assertGreater(choices, 0, f"Deadlocked abstract state: {state}")
++            self.assertEqual(completed, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/FFN_REDUCTION.md
+@@ -0,0 +1,80 @@
++# FFN-output reduction implementation, version 0.4.3
++
++## Files and behavior
++
++| File | Change |
++|---|---|
++| `runtime/spec.py` | `ffn_reduction=collective|ipc`; specialization agreement and barrier accounting |
++| `integration.py` | Reads `QWEN38_FFN_REDUCTION` when constructing the controller |
++| `runtime/peer.py` | Mailbox purpose checked during bootstrap; separate FFN arena uses existing allocator/IPC lifecycle |
++| `mono/runner.py` | Creates FFN arena, forwards its table and FFN scale, suppresses duplicate output collective, exposes collective teardown |
++| `mono/_flydsl_kernel.py` | Direct BF16 W2 publication and in-kernel global SUM/scaling |
++| `mono/a16w16.py` | Revised launch ABI and specialization; distinct kernel name prevents stale ABI cache reuse |
++| `runtime/executor.py` | Defers FFN scale into the active epilogue, preserves stock fallback scaling |
++| `validate_tp.py` | Independent rank-order reference, dual epoch wrap, FFN-stage dropped-CTA test |
++| `compile_smoke.py` | Covers old/new reduction combinations and first/last TP ranks |
++
++The new kernel ABI has 14 pointers, seven scalar values and the stream object.
++Use all files from this release together. The internal `drop_ffn_cta` argument
++is only for qualification; serving always passes -1.
++
++## Final-output boundary
++
++For each output element on every TP rank:
++
++```python
++# Conceptual arithmetic, not additional host kernels:
++local_partial = bf16(local_W2_accumulator)
++# Publish local_partial in the FFN mailbox, synchronize all ranks.
++reduced = bf16(sum_fp32_in_rank_order(peer_partial[r] for r in tp_ranks))
++output = bf16(reduced * bf16(1 + bf16(ffn_scale))) if scale_enabled else reduced
++```
++
++W2 never publishes an incomplete K reduction. Every CTA enters the publication
++barrier, including CTAs with no output tile. The peer SUM writes to the ordinary
++output tensor; the mailbox contains local partials and is not overwritten with
++the global output while peers still read it. The runner returns this output
++without another FFN all-reduce. The residual output is kept unchanged.
++
++## Failure sites
++
++Existing attention and compute sites are preserved. Added sites are:
++
++| Site | Stage |
++|---:|---|
++| 20 | All local W2 writers reached FFN publication barrier |
++| 21 | Local broadcast after FFN READY exchange |
++| 22 | All local FFN peer readers retired |
++| 23 | Local broadcast after FFN DONE exchange |
++| 30 | FFN READY peer wait |
++| 31 | FFN DONE peer wait |
++
++Flags are uint32 and compare exact epochs. Both arenas start at zero, advance
++independently and wrap modulo 2^32. The hardware test seeds them differently
++and executes across rollover to detect accidental aliasing. Host tests explore
++all abstract interleavings of three attention/FFN invocation pairs for TP2/TP4.
++That model assumes memory visibility and is not a hardware memory-model proof.
++
++A failure from any phase is published to both enabled arenas before kernel
++exit. Local waits are bounded by iterations, not wall-clock time. On a fault,
++discard the step and stop all workers. There is no clear-and-resume operation.
++The separate int32 health collective at the end of a forward remains necessary.
++
++## Validation scope
++
++The host tests exercise CPU numerical references, active/fallback transitions,
++TP subgroups, layer-scale ordering, exact-base allocation diagnostics, and
++mocked host dispatch proving that a fused result is not reduced a second time.
++They do not execute peer loads. The staged torch backend uses FP32 collective
++accumulation as a reference and should not be benchmarked as the mono kernel.
++
++ISA generation confirms compiler compatibility and device-scope/system-scope
++instructions, but does not test HIP IPC export, mappings, peer visibility or
++launch residency. Full-size new variants report 45–46 VGPRs, 44–47 SGPRs,
++24 bytes fixed LDS and zero private-segment bytes. These are compiler metadata,
++not measured occupancy or speedup. GPU qualification commands are in README.md.
++
++No real distributed test was rerun in this update: previous attempts in this
++workspace failed during Gloo transport initialization with Operation not permitted.
++All 61 current host tests use local CPU execution or mocks; all 32 compiler
++cases use gfx1201 ISA output without a live GPU or ELF linking.

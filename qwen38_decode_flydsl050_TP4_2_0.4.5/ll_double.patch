@@ -1,0 +1,1337 @@
+--- /dev/null
++++ b/DOUBLE_BUFFER.md
+@@ -0,0 +1,186 @@
++# Double-buffer LL protocol, version 0.4.5
++
++This builds on the delivered 0.4.4 package. Select the new implementation with
++`QWEN38_IPC_PROTOCOL=ll_double` on every worker. The existing `ll` and `simple`
++protocols retain their preceding behavior; `simple` remains the default.
++
++## Enable and qualify
++
++Install the complete package in the worker environment and restart all ranks:
++
++```bash
++python -m pip install --no-deps -e .
++
++export QWEN38_SPECIALIZED_DECODE=1
++export QWEN38_FFN_BACKEND=flydsl
++export QWEN38_ATTENTION_INPUT=partial
++export QWEN38_FFN_REDUCTION=ipc
++export QWEN38_IPC_PROTOCOL=ll_double
++export QWEN38_IPC_ALLOCATOR=hipmalloc
++```
++
++Keep the allocator and HSA settings that work on your system; the example uses
++the explicit-base hipMalloc option. TP2 and TP4 use the same protocol setting.
++`NCCL_PROTO` does not select this custom FlyDSL path. No new HIP/C++ kernel or
++runtime collective is introduced. The existing vLLM installation hooks and
++`--enforce-eager` integration guard remain. Standalone graph replay is supported
++by the design and must be qualified on your hardware.
++
++```bash
++python -m unittest discover -s tests -v
++python compile_smoke.py --isa-only --protocol all
++
++QWEN38_IPC_ALLOCATOR=hipmalloc \
++torchrun --standalone --nproc-per-node=2 validate_tp.py \
++  --ipc-protocol ll_double --attention-partials --attention-scale \
++  --ffn-reduction ipc --ffn-scale --small --ll-stress 100 --ll-skew-ms 1
++
++QWEN38_IPC_ALLOCATOR=hipmalloc \
++torchrun --standalone --nproc-per-node=2 validate_tp.py \
++  --ipc-protocol ll_double --attention-partials --attention-scale \
++  --ffn-reduction ipc --ffn-scale --ll-stress 1000 --ll-skew-ms 1 \
++  --graph --fault-test
++```
++
++Repeat with four processes. Test attention-only and FFN-only configurations as
++well. Compare with `--ipc-protocol ll`, then `simple` (omit LL stress options for
++simple). ELF compilation with the local ROCm linker is available by omitting
++`--isa-only`. The standalone validator uses real process groups for references.
++
++## Buffer lifetime proof
++
++Each reduction owns two IPC payload banks. Successive participating mono calls
++alternate banks. A rank may begin invocation k+1 only after its complete local
++kernel for k has finished, including all its peer reads. A rank can complete
++k+1 only after consuming fresh k+1 words from every peer. Those words prove that
++each peer has finished its own kernel k. Therefore, when any rank begins k+2,
++every peer has retired reads of k's bank, and that bank can be overwritten.
++
++This removes the explicit DONE acknowledgment; it does not assume equal GPU
++speed. A fast rank may publish one invocation ahead into the other bank, but
++LL polling prevents completion until the slow ranks advance. Buffer reuse is
++protected by this dependency, not by the per-CTA counters described below.
++
++Required execution contract:
++
++- One serialized stream and no overlapping kernels/graphs on a workspace.
++- Identical ordered, nonempty participating invocations and physical row counts
++  across the TP group. Ineligible steps bypass the mono path on all ranks.
++- Every invocation consumes every peer's active payload before local kernel
++  completion. One invocation per arena per kernel; no independent CTA loops
++  that advance into subsequent invocations inside the same kernel.
++- Sticky failures stop the group. An incomplete call does not grant permission
++  to recover or switch protocols while buffers remain live.
++
++Graph replay preserves this contract only when replays sharing the runner are
++serialized. The runner retains its stream-binding check. Explicit teardown
++still synchronizes every rank, closes all imports, then frees owners; no buffer
++is freed merely because one rank has returned from its kernel.
++
++## State and memory layout
++
++The new bootstrap layout ID is 3. Mixed old/new layouts are rejected.
++
++| Byte offset | Contents |
++| ---: | --- |
++| 0 | Owner READY counter, used only by the rollover handshake |
++| 128 | Reserved DONE; remains zero |
++| 256 | Reserved legacy EPOCH; unused |
++| 384 | Sticky FAILED flag |
++| 512–1023 | 64 owner-local uint64 sequence counters, one per possible CTA |
++| 1024 onward | Two packed payload banks, each with capacity 16 rows |
++
++Each packed uint64 remains two BF16 values in the low 32 bits and a uint32 tag
++in the upper 32 bits. All accesses are aligned and use system-scope atomic
++release stores/acquire loads. Accepted payload comes from the same loaded word
++as its tag. There are no remote atomic read-modify-write operations.
++
++For a sequence s in `[0, 2 * 0xffffffff)`:
++
++```python
++bank = s & 1
++tag = (s >> 1) + 1
++next_sequence = (s + 1) % (2 * 0xffffffff)
++```
++
++Zero is never a valid payload tag. The cycle length is even, so bank alternation
++continues correctly across rollover. Fresh arenas initialize every CTA counter
++to 2: zero-filled banks can immediately use bank 0/tag 2, then bank 1/tag 2,
++without performing an unnecessary startup scrub.
++
++Thread 0 snapshots its CTA's counter into LDS, followed by a CTA-local barrier.
++All threads then use that immutable snapshot. Thread 0 advances only its own
++counter; other CTAs neither read it nor treat it as completion. All active CTAs
++advance, including CTAs with no assigned tiles or payload words. The next kernel
++cannot read these counters until every block of the current kernel has exited.
++Attention and FFN have independent counters. No host sequence is captured into
++a graph, and zero-row warmup does not access or advance these states.
++
++At H=5120, each arena occupies `1024 + 2 * 16 * 5120 * 4 = 656384` bytes.
++Both arenas use **1312768 bytes (1282 KiB) per GPU**. This doubles storage relative
++to single-bank LL, but does not double its per-invocation transfer volume.
++
++## Rollover without touching active readers
++
++At sequence 0 or 1, the corresponding bank's tag wraps to one. Every owner
++scrubs the full 16-row capacity of **that selected bank only**, then completes
++a wrap-generation handshake before any consumer accepts tag one. Two local grid
++barriers surround that rare handshake. The ordinary reuse proof already makes
++this selected bank safe to scrub; the other bank may still be read by a peer.
++
++The following invocation scrubs the other bank when it becomes safe. Clearing
++both banks together would violate the lifetime proof. Clearing only active rows
++would leave stale tags that could match future generations after row expansion.
++
++## Synchronization and arithmetic
++
++| Local grid barrier purpose | Single-bank LL | Double-buffer LL |
++| --- | ---: | ---: |
++| Attention reduction / result availability | 2 | 1 |
++| Normalized inputs before W13 | 1 | 1 |
++| SwiGLU results before W2 | 1 | 1 |
++| FFN reduction completion / reuse | 2 | 0 |
++| Both reductions enabled, normal path | 6 | 3 |
++
++The remaining attention barrier makes the reduced scratch rows available to
++RMSNorm across CTAs. After FFN reduction, ordinary kernel completion supplies
++the local completion boundary. FFN-only double buffering has two normal grid
++barriers; attention-only has three. Rollover adds two per wrapping arena.
++There is no normal-path READY/DONE exchange. LL polling, CTA barriers, local
++sequence loads/stores, and the once-per-forward fault collective still exist.
++
++W2 publishes packed BF16 results directly into the selected bank. Rank-ordered
++FP32 summation, BF16 rounding, layer-scale placement and separate residuals are
++unchanged. This remains one-shot all-reduce. Neither reduction adds a kernel
++launch. No performance improvement is claimed without measurements.
++
++## Validation and diagnostics
++
++74 host tests passed, including exhaustive finite TP2/TP4 models with variable
++row counts, independently progressing word producers, reuse and two tag wraps.
++Negative variants demonstrate overwrite with one bank, overwrite when both
++banks are scrubbed together, and stale acceptance without rollover scrubbing. These models assume coherent atomic words and
++whole-kernel stream order; they are not hardware proofs.
++
++112 gfx1201 ISA-generation variants passed: 32 FFN variants for each of three
++protocols and eight bit-pattern probes for each LL protocol. The generated
++packed accesses use system-scope 64-bit loads/stores. New FFN variants show no
++private-memory spills in the inspected metadata. ELF linking, GPU numerics,
++IPC coherence, live occupancy, replay, fault injection and latency remain
++**unverified here because no AMD GPU is available**.
++
++The GPU stress test alternates bank usage and row counts, inserts zero-row
++launches, delays different ranks, verifies every active CTA's next sequence,
++and checks that DONE remains zero. Rollover tests poison both banks with stale
++tags, including rows inactive during each scrub. The numerical and graph tests
++retain the independent reference and padding checks. FFN fault injection drops
++one CTA's packed publication while retaining its reader to detect the timeout.
++
++Diagnostic sites: attention LL polling 50, local result barrier 52, rollover
++55–57; FFN LL polling 60, rollover 65–67; transport probe 70–77, with 71 indicating
++a bit-pattern mismatch. Existing computation barriers retain sites 1 and 2.
++
++See `VALIDATION.json`, `validation/double_host_tests.txt` and
++`validation/double_isa/compile_report.json`. `ll_double.patch` is a portable
++source/docs patch against the extracted 0.4.4 package root; the ZIP also includes
++the generated validation evidence and refreshed hash manifest.
+--- a/IPC_TP2_FIX.md
++++ b/IPC_TP2_FIX.md
+@@ -3,7 +3,7 @@
+ Reviewed `juripero/Temp` commit `efe05e2a28d35c844d34b52f20d3aebc349f5b9c`,
+ directory `qwen38_decode_flydsl050_TP4_2`.
+ 
+-This guide describes the allocator change retained in version 0.4.4. For the
++This guide describes the allocator change retained in version 0.4.5. For the
+ new fused FFN reduction, installation and current validation, use README.md and
+ FFN_REDUCTION.md. The historical `ipc_fix.patch` is against the older reviewed
+ commit; the current patch is `ffn_reduction.patch` against commit aeda0e4.
+--- a/LL_PACKING.md
++++ b/LL_PACKING.md
+@@ -1,4 +1,8 @@
+-# LL packing in 0.4.4
++# Single-bank LL packing introduced in 0.4.4
++
++This protocol remains selectable as `QWEN38_IPC_PROTOCOL=ll` in 0.4.5.
++For two banks without normal-path DONE, use `ll_double` and read
++[DOUBLE_BUFFER.md](DOUBLE_BUFFER.md). The counts below describe the 0.4.4 baseline.
+ 
+ This extends the linked 0.4.3 source at Temp commit
+ `7fc6f18f31a072b127ada26bb64c9cd915ca872d`. Both reductions remain direct peer-read,
+--- a/NOTICE.txt
++++ b/NOTICE.txt
+@@ -26,3 +26,7 @@
+ Version 0.4.4 adds opt-in scalar-64-bit LL publication/polling for both peer
+ reductions, wrap scrubbing with a reserved invalid tag, and a GPU bit-pattern
+ probe. Uses FlyDSL/LLVM atomic load/store APIs; no RCCL/NCCL source is copied.
++
++Version 0.4.5 adds a separate ll_double protocol, two payload banks per arena,
++per-CTA sequence snapshots, safe per-bank rollover scrubbing, and qualification
++for skewed launches and skipped zero-row calls. No normal-path DONE is published.
+--- a/README.md
++++ b/README.md
+@@ -1,13 +1,17 @@
+ # Qwen BF16 mono decode: fused attention and FFN-output reductions
+ 
+-Version **0.4.4**, FlyDSL **0.5.0**, target **gfx1201**, TP1/TP2/TP4.
+-Built on `juripero/Temp` commit **7fc6f18f31a072b127ada26bb64c9cd915ca872d**,
++Version **0.4.5**, FlyDSL **0.5.0**, target **gfx1201**, TP1/TP2/TP4.
++Built on the delivered **0.4.4** package (SHA-256
++`c2ba9803761ef4ac8657dd6dc0e8c7be1a9895ea92498309dcb727eb543050ca`),
++whose original source was `juripero/Temp` commit **7fc6f18f31a072b127ada26bb64c9cd915ca872d**,
+ directory `qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2/qwen38_decode_flydsl050_TP4_2`.
+ 
+-New in 0.4.4: **`QWEN38_IPC_PROTOCOL=ll`** enables packed BF16/epoch words
+-for both fused reductions. The default `simple` retains 0.4.3's separate
+-READY/DONE protocol. See [LL_PACKING.md](LL_PACKING.md) for the design,
+-qualification commands, epoch rollover, and tradeoffs.
++New in 0.4.5: **`QWEN38_IPC_PROTOCOL=ll_double`** alternates two LL banks per
++reduction and removes normal-path DONE exchanges. With both reductions fused,
++there are **three local grid barriers**, down from six in 0.4.4's `ll` mode.
++The existing `ll` and `simple` modes remain available, and `simple` remains the
++default. See [DOUBLE_BUFFER.md](DOUBLE_BUFFER.md) for the proof, rollover,
++stream/participation contract, and qualification commands.
+ 
+ Set **`QWEN38_FFN_REDUCTION=ipc`** to absorb the FFN-output SUM into the
+ FlyDSL kernel. With `QWEN38_ATTENTION_INPUT=partial`, eligible decode runs
+@@ -38,7 +42,7 @@
+ QWEN38_FFN_BACKEND=flydsl \
+ QWEN38_ATTENTION_INPUT=partial \
+ QWEN38_FFN_REDUCTION=ipc \
+-QWEN38_IPC_PROTOCOL=ll \
++QWEN38_IPC_PROTOCOL=ll_double \
+ QWEN38_IPC_ALLOCATOR=hipmalloc \
+   vllm serve /path/to/checkpoint --dtype bfloat16 \
+   --tensor-parallel-size 2 --enforce-eager
+@@ -63,11 +67,17 @@
+ source anchors. It disables only the attention output-projection reduction
+ when `partial` is selected. **Keep stock MLP reduction enabled**, because prefill
+ and ineligible decode still use it. Do not globally disable all collectives.
+-`ll_packing.patch` applies this update to the exact reviewed 0.4.3 Temp commit;
+-apply it from the Temp repository root, or install the supplied complete package.
+-The source patch omits generated validation artifacts and the hash manifest;
+-the downloadable package includes those files.
+-The older `ffn_reduction.patch` and `ipc_fix.patch` are historical patches.
++`ll_double.patch` applies this source update from inside an extracted **0.4.4
++package directory** (the directory containing `pyproject.toml`):
++
++```bash
++git apply --check /path/to/ll_double.patch
++git apply /path/to/ll_double.patch
++```
++
++Alternatively install this complete package. The patch omits generated
++validation artifacts and the hash manifest; the ZIP includes them. Older patch
++files are historical and target their own baselines.
+ 
+ ## Supported model and execution
+ 
+@@ -123,35 +133,37 @@
+ 
+ ## Peer buffers and synchronization
+ 
+-The FFN mailbox is separate from the attention mailbox. Both have independent
+-READY/DONE/EPOCH/FAILED flags and independently exchanged pointer tables.
+-Each has a 512-byte header. At H=5120 and capacity 16:
+-
+-| Protocol | Payload layout | Bytes per arena per GPU | Grid barriers with both reductions |
++The FFN mailbox is separate from the attention mailbox. At H=5120/capacity 16:
++
++| Protocol | Payload layout | Bytes per arena per GPU | Normal grid barriers, both reductions |
+ | --- | --- | ---: | ---: |
+-| `simple` (default) | BF16 array, separate READY flag | 164352 (160.5 KiB) | 10 |
+-| `ll` (opt-in) | Two BF16 values + uint32 epoch per uint64 | 328192 (320.5 KiB) | 6 normally |
+-
+-Both arenas together use 641 KiB per GPU in LL mode and are reused across layers.
+-W2 writes directly into the FFN arena. In LL mode, each pair is stored with its
+-readiness epoch in a single aligned system-scope atomic uint64 operation.
+-Readers reduce the data from the accepted load, avoiding separate whole-buffer
+-READY publication. Every local reader still retires before DONE, and every owner
+-waits for all ranks' DONE before reusing its arena. The two compute grid barriers
+-also remain. LL reserves epoch zero; at rollover, a full-capacity scrub and a
+-wrap handshake add two grid barriers per wrapped arena before resuming at one.
+-
+-Only owners write their payload/flags; peers use loads, not remote atomic RMWs.
+-The output collective is skipped only for the FlyDSL fused-FFN specialization;
+-the staged torch backend performs a reference FP32 collective instead.
+-Live kernel residency is checked before launch. GPU failures are sticky and
+-published to both active mailboxes; the model-forward fault collective remains.
+-Unexpected rank failure or transport failure requires stopping the TP group.
++| `simple` (default) | One BF16 array plus READY/DONE | 164352 | 10 |
++| `ll` | One packed BF16/epoch bank plus DONE | 328192 | 6 |
++| `ll_double` | Two packed banks plus per-CTA sequence counters | 656384 | 3 |
++
++Two double-buffer arenas together use **1312768 bytes (1282 KiB) per GPU**.
++W2 writes packed results directly into its selected FFN bank. Only owners write
++payloads and flags; peers use system-scope atomic loads, not remote atomic RMWs.
++The two banks have the same transfer volume per invocation as single-bank LL.
++
++In `ll_double`, sequential kernel completion and consumption of every peer's
++preceding invocation make reuse safe without DONE. One attention-result barrier
++and the two FFN computation barriers remain. Per-CTA device counters snapshot
++an immutable sequence for each invocation, including blocks with no assigned
++output work. Zero-row warmup and stock fallback do not advance the counters.
++Graph replay does not capture a fixed host sequence number. Rollovers scrub the
++entire capacity of only the bank being reused and add two barriers per wrapping
++arena. The other bank can still have readers and must not be cleared early.
++
++Live residency is checked before launch. The workspace is restricted to one
++serialized stream with identical nonempty participating calls on all TP ranks.
++Failures are sticky; stop the group rather than attempting protocol fallback.
++The once-per-forward fault collective is retained.
+ 
+ `QWEN38_IPC_ALLOCATOR=hipmalloc` uses exact-base `hipMalloc` export; the default
+ remains `uncached`. Both must support the required peer visibility on your
+ ROCm/driver/PCIe stack. Prior successful TP2 operation is useful evidence for
+-that setup, but the new direct W2 publication phase needs GPU qualification.
++that setup, but the new double-buffer protocol still needs GPU qualification.
+ All ranks must reside on one host, use distinct GPUs, have directed peer access,
+ and see every TP GPU. Allocation and IPC mode settings must agree across ranks.
+ 
+@@ -163,13 +175,14 @@
+ 
+ ## Validation and qualification
+ 
+-**66 host tests passed**. FlyDSL 0.5.0 tracing, MLIR lowering and LLVM
+-**gfx1201 ISA generation passed for 72 variants**: 64 FFN specializations
+-(32 per protocol) and 8 LL bit-pattern probe specializations. LL variants were
++**74 host tests passed**. FlyDSL 0.5.0 tracing, MLIR lowering and LLVM
++**gfx1201 ISA generation passed for 112 variants**: 96 FFN specializations
++(32 per protocol) and 16 LL transport probe specializations. LL variants were
+ checked for system-scope 64-bit load/store instructions. Python syntax and
+-undefined-name checks passed. See `VALIDATION.json`, `validation/ll_host_tests.txt`,
+-and `validation/ll_isa/compile_report.json`. Earlier validation directories are
+-historical evidence and are not new GPU results.
++undefined-name checks passed. See `VALIDATION.json`, `validation/double_host_tests.txt`,
++and `validation/double_isa/compile_report.json`. Earlier directories are
++historical evidence. The protocol model explores variable rows, reuse and two
++rollovers, and rejects unsafe single-bank and missing-scrub variants.
+ 
+ No AMD GPU is available in the build environment. **ELF linking, GPU execution,
+ peer memory ordering, numerical parity on GPU, live occupancy, graph replay,
+@@ -189,17 +202,17 @@
+ QWEN38_IPC_ALLOCATOR=hipmalloc \
+   torchrun --standalone --nproc-per-node=2 validate_tp.py \
+   --attention-partials --attention-scale --ffn-reduction ipc --ffn-scale --small \
+-  --ipc-protocol ll --ll-stress 100
++  --ipc-protocol ll_double --ll-stress 100
+ 
+ # Then: actual dimensions, replay, independent epoch wrap, and faults.
+ QWEN38_IPC_ALLOCATOR=hipmalloc \
+   torchrun --standalone --nproc-per-node=2 validate_tp.py \
+   --attention-partials --attention-scale --ffn-reduction ipc --ffn-scale \
+-  --ipc-protocol ll --ll-stress 1000 --graph --fault-test
+-```
+-
+-Repeat with four processes for TP4 and compare with `--ipc-protocol simple`
+-(omit `--ll-stress` for simple). Also test `--ffn-reduction ipc` without
++  --ipc-protocol ll_double --ll-stress 1000 --ll-skew-ms 1 --graph --fault-test
++```
++
++Repeat with four processes for TP4 and compare with `--ipc-protocol ll` and
++`--ipc-protocol simple` (omit `--ll-stress`/`--ll-skew-ms` for simple). Also test `--ffn-reduction ipc` without
+ `--attention-partials`/`--attention-scale`, and the old `--ffn-reduction collective`
+ path without `--ffn-scale`. `validate.py` remains the original TP1 harness.
+ The standalone TP validator uses explicit process groups and their host groups;
+--- a/compile_smoke.py
++++ b/compile_smoke.py
+@@ -62,7 +62,7 @@
+                 raise AssertionError(f"Missing ISA marker: {marker}")
+         if (partial or ffn_reduce) and tp > 1 and "scope:SCOPE_SYS" not in assembly:
+             raise AssertionError("Missing system-scope peer ordering in ISA")
+-        if ipc_protocol == "ll" and tp > 1 and (partial or ffn_reduce):
++        if ipc_protocol in ("ll", "ll_double") and tp > 1 and (partial or ffn_reduce):
+             for op in ("global_load_b64", "global_store_b64"):
+                 if not re.search(op + r"[^\n]*scope:SCOPE_SYS", assembly):
+                     raise AssertionError(f"LL requires a system-scope 64-bit {op}")
+@@ -87,14 +87,14 @@
+     return result
+ 
+ 
+-def compile_probe_one(hidden, blocks, tp, rank, output, isa_only):
++def compile_probe_one(hidden, blocks, tp, rank, output, isa_only, ipc_protocol="ll"):
+     from specialized_decode.mono.ll_probe import build_probe
+-    compiled = build_probe(hidden, blocks, tp, rank)
++    compiled = build_probe(hidden, blocks, tp, rank, ipc_protocol)
+     if compiled._runtime_ready:
+         raise AssertionError("Probe placeholder compilation initialized the GPU")
+     obj = _objects(compiled)
+     blob = obj.encode() if isinstance(obj, str) else bytes(obj)
+-    result = {"kind": "ll_bit_pattern_probe", "hidden": hidden, "blocks": blocks,
++    result = {"kind": "ll_bit_pattern_probe", "ipc_protocol": ipc_protocol, "hidden": hidden, "blocks": blocks,
+               "tp_size": tp, "tp_rank": rank, "target": "gfx1201", "executed_on_gpu": False}
+     suffix = ".hsaco"
+     if isa_only:
+@@ -106,7 +106,7 @@
+         result["ll_system_b64_load_store"] = True
+     elif not blob.startswith(b"\x7fELF"):
+         raise AssertionError("Probe compiler did not produce ELF")
+-    path = output / f"ll_probe_h{hidden}_b{blocks}_tp{tp}r{rank}{suffix}"
++    path = output / f"ll_probe_h{hidden}_b{blocks}_tp{tp}r{rank}_p{ipc_protocol}{suffix}"
+     path.write_bytes(blob)
+     result.update(artifact=path.name, sha256=hashlib.sha256(blob).hexdigest())
+     return result
+@@ -116,7 +116,7 @@
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--isa-only", action="store_true")
+     parser.add_argument("--output", type=Path, default=Path("build/flydsl050"))
+-    parser.add_argument("--protocol", choices=("simple", "ll", "both"), default="both")
++    parser.add_argument("--protocol", choices=("simple", "ll", "ll_double", "both", "all"), default="all")
+     args = parser.parse_args()
+     args.output.mkdir(parents=True, exist_ok=True)
+     os.environ.setdefault("FLYDSL_GPU_ARCH", "gfx1201")
+@@ -130,14 +130,16 @@
+                  for partial in (False, True)
+                  for ffn_reduce in ((False, True) if tp > 1 else (False,))
+                  for rank in ((0, tp - 1) if (partial or ffn_reduce) and tp > 1 else (0,))]
+-        protocols = ("simple", "ll") if args.protocol == "both" else (args.protocol,)
++        protocols = (("simple", "ll", "ll_double") if args.protocol == "all" else
++                     (("simple", "ll") if args.protocol == "both" else (args.protocol,)))
+         results = [compile_one(h, i, b, args.output, args.isa_only, tp, rank, partial, ffn_reduce, protocol)
+                 for protocol in protocols
+                 for h, i, b, tp, rank, partial, ffn_reduce in cases]
+-        if "ll" in protocols:
+-            results.extend(compile_probe_one(h, b, tp, rank, args.output, args.isa_only)
+-                           for h, b in ((32, 4), (5120, 64))
+-                           for tp in (2, 4) for rank in (0, tp - 1))
++        for protocol in protocols:
++            if protocol in ("ll", "ll_double"):
++                results.extend(compile_probe_one(h, b, tp, rank, args.output, args.isa_only, protocol)
++                               for h, b in ((32, 4), (5120, 64))
++                               for tp in (2, 4) for rank in (0, tp - 1))
+         return results
+ 
+     if args.isa_only:
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@
+ 
+ [project]
+ name = "qwen38-gfx1201-decode"
+-version = "0.4.4"
++version = "0.4.5"
+ description = "Qwen3.5-compatible 27B TP1/TP2/TP4 BF16 FlyDSL 0.5.0 attention SUM and FFN source and validation tools"
+ requires-python = ">=3.10"
+ dependencies = []
+--- a/specialized_decode/mono/_flydsl_kernel.py
++++ b/specialized_decode/mono/_flydsl_kernel.py
+@@ -16,7 +16,8 @@
+ from flydsl.compiler.ast_rewriter import ASTRewriter
+ from flydsl.expr import math as fmath
+ from ._peer_kernel import acquire, release, flag_ptr, data_ptr, peer_phase
+-from .peer_layout import READY, DONE, EPOCH, FAILED
++from .peer_layout import READY, DONE, EPOCH, FAILED, DATA, DB_DATA
++from ._ll_double_kernel import snapshot_sequence, sequence_tag, sequence_offset, advance_sequence
+ from ._ll_kernel import ll_ptr, publish_word, read_word, unpack_first, unpack_second
+ 
+ 
+@@ -193,8 +194,9 @@
+ 
+ 
+ @ASTRewriter.transform
+-def ll_reduce(out, peers, epoch, scale, has_scale, control, fault, ok,
+-              tid, bid, rows, hidden, blocks, max_spins, tp, rank, site):
++def ll_sum(out, peers, epoch, scale, has_scale, fault,
++           tid, bid, rows, hidden, blocks, max_spins, tp, rank, site,
++           word_offset=0, data_offset=DATA):
+     own = fx.generic_load(peers + rank)
+     # Each word carries its own readiness. All producer CTAs must be resident
+     # (checked at warmup); no whole-buffer READY/grid barrier is necessary.
+@@ -203,7 +205,7 @@
+         second = fx.Float32(0.0)
+         for peer in fx.range_constexpr(tp):
+             remote = fx.generic_load(peers + peer)
+-            word = read_word(remote, own, index, epoch, fault, max_spins, site)
++            word = read_word(remote, own, index, epoch, fault, max_spins, site, word_offset, data_offset)
+             first = first + unpack_first(word)
+             second = second + unpack_second(word)
+         col = (index * 2) % hidden
+@@ -211,6 +213,13 @@
+         second = scaled_bf16(second.to(fx.BFloat16).to(fx.Float32), col + 1, scale, has_scale)
+         fx.generic_store(out + index * 2, first.to(fx.BFloat16))
+         fx.generic_store(out + index * 2 + 1, second.to(fx.BFloat16))
++
++
++@ASTRewriter.transform
++def ll_reduce(out, peers, epoch, scale, has_scale, control, fault, ok,
++              tid, bid, rows, hidden, blocks, max_spins, tp, rank, site):
++    ll_sum(out, peers, epoch, scale, has_scale, fault, tid, bid, rows, hidden,
++           blocks, max_spins, tp, rank, site)
+     ll_retire(peers, epoch, control, fault, ok, tid, bid, blocks, max_spins, tp, rank, site)
+ 
+ 
+@@ -228,18 +237,63 @@
+                   tid, bid, rows, hidden, blocks, max_spins, tp, rank, 50)
+ 
+ 
++@ASTRewriter.transform
++def db_prepare(peers, sequence_slot, control, fault, ok, tid, bid, hidden,
++               blocks, max_spins, tp, rank, site):
++    own = fx.generic_load(peers + rank)
++    sequence = snapshot_sequence(own, sequence_slot, tid, bid)
++    if sequence < fx.Uint64(2):
++        # Clear only the bank being reused: a slow peer may STILL be reading
++        # the other bank. Reuse of this bank is already safe by stream order
++        # and consumption of every peer's preceding invocation.
++        offset = sequence_offset(sequence, hidden)
++        for index in range(bid * 128 + tid, 16 * hidden // 2, blocks * 128):
++            release(ll_ptr(own, DB_DATA) + offset + index, fx.Uint64(0))
++        fx.memory_fence(syncscope=fx.SyncScope.System, ordering=fx.AtomicOrdering.Release)
++        grid_barrier(control, fault, ok, tid, bid, blocks, max_spins, site + 5)
++        if fx.ptr_load(ok) != 0:
++            if (bid == 0) & (tid == 0):
++                wrap_epoch = acquire(flag_ptr(own, READY)) + fx.Uint32(1)
++                peer_phase(peers, own, wrap_epoch, fault, tp, READY, max_spins, site + 6)
++            grid_barrier(control, fault, ok, tid, bid, blocks, max_spins, site + 7)
++    return sequence
++
++
++@ASTRewriter.transform
++def reduce_attention_double(a, reduced, peers, scale, has_scale, sequence_slot,
++                            control, fault, ok, tid, bid, rows, hidden, blocks,
++                            max_spins, tp, rank):
++    sequence = db_prepare(peers, sequence_slot, control, fault, ok, tid, bid,
++                          hidden, blocks, max_spins, tp, rank, 50)
++    if fx.ptr_load(ok) != 0:
++        own = fx.generic_load(peers + rank)
++        epoch = sequence_tag(sequence)
++        offset = sequence_offset(sequence, hidden)
++        for index in range(bid * 128 + tid, rows * hidden // 2, blocks * 128):
++            publish_word(ll_ptr(own, DB_DATA) + offset + index,
++                         fx.generic_load(a + index * 2), fx.generic_load(a + index * 2 + 1), epoch)
++        ll_sum(reduced, peers, epoch, scale, has_scale, fault, tid, bid, rows, hidden,
++               blocks, max_spins, tp, rank, 50, offset, DB_DATA)
++        # RMSNorm reads full rows produced across multiple CTAs. This local
++        # dependency remains; no peer completion acknowledgment is sent.
++        grid_barrier(control, fault, ok, tid, bid, blocks, max_spins, 52)
++        advance_sequence(own, sequence, tid, bid)
++
++
+ def make_launcher(hidden, intermediate, blocks, tp=1, rank=0, attention_partial=False,
+                   ffn_reduce=False, ipc_protocol="simple"):
+     peer_mode = attention_partial and tp > 1
+     ffn_peer_mode = ffn_reduce and tp > 1
+-    ll_mode = ipc_protocol == "ll"
++    ll_mode = ipc_protocol in ("ll", "ll_double")
++    double_mode = ipc_protocol == "ll_double"
+     @fx.struct
+     class Lds:
+         red: fx.Array[fx.Float32, 4, 4]
+         inv: fx.Array[fx.Float32, 1, 4]
+         ok: fx.Array[fx.Int32, 1, 4]
+-
+-    @flyc.kernel(name=f"qwen_bf16_ffnar_v2_h{hidden}_i{intermediate}_b{blocks}_tp{tp}r{rank}_a{int(attention_partial)}_f{int(ffn_reduce)}_p{ipc_protocol}",
++        sequence: fx.Array[fx.Uint64, 1, 8]
++
++    @flyc.kernel(name=f"qwen_bf16_ffnar_v3_h{hidden}_i{intermediate}_b{blocks}_tp{tp}r{rank}_a{int(attention_partial)}_f{int(ffn_reduce)}_p{ipc_protocol}",
+                  known_block_size=[128, 1, 1])
+     def ffn(a: fx.Pointer, residual: fx.Pointer, norm: fx.Pointer,
+             w13: fx.Pointer, w2: fx.Pointer, out: fx.Pointer,
+@@ -267,7 +321,11 @@
+                 attention = a
+                 if fx.const_expr(peer_mode):
+                     attention = scratch + 16 * (hidden + intermediate)
+-                    if fx.const_expr(ll_mode):
++                    if fx.const_expr(double_mode):
++                        reduce_attention_double(a, attention, peers, attn_scale, has_attn_scale,
++                                                lds.sequence.ptr, control, fault, lds.ok.ptr,
++                                                tid, bid, rows, hidden, blocks, max_spins, tp, rank)
++                    elif fx.const_expr(ll_mode):
+                         reduce_attention_ll(a, attention, peers, attn_scale, has_attn_scale,
+                                             control, fault, lds.ok.ptr, tid, bid, rows,
+                                             hidden, blocks, max_spins, tp, rank)
+@@ -344,9 +402,17 @@
+                         if fx.ptr_load(lds.ok.ptr) != 0:
+                             down_output = out
+                             ffn_epoch = fx.Uint32(0)
++                            ffn_sequence = fx.Uint64(0)
++                            ffn_word_offset = fx.Int32(0)
+                             if fx.const_expr(ffn_peer_mode):
+                                 down_output = data_ptr(fx.generic_load(ffn_peers + rank))
+-                                if fx.const_expr(ll_mode):
++                                if fx.const_expr(double_mode):
++                                    ffn_sequence = db_prepare(ffn_peers, lds.sequence.ptr, control, fault,
++                                                              lds.ok.ptr, tid, bid, hidden, blocks,
++                                                              max_spins, tp, rank, 60)
++                                    ffn_epoch = sequence_tag(ffn_sequence)
++                                    ffn_word_offset = sequence_offset(ffn_sequence, hidden)
++                                elif fx.const_expr(ll_mode):
+                                     ffn_epoch = ll_prepare(ffn_peers, control, fault, lds.ok.ptr,
+                                                            tid, bid, hidden, blocks, max_spins,
+                                                            tp, rank, 60)
+@@ -367,7 +433,8 @@
+                                             # lane; no shuffle or intermediate BF16 copy.
+                                             for j in fx.range_constexpr(4):
+                                                 feature = tile * 16 + khalf + j * 2
+-                                                published = ll_ptr(fx.generic_load(ffn_peers + rank))
++                                                published = ll_ptr(fx.generic_load(ffn_peers + rank),
++                                                                   DB_DATA if double_mode else DATA) + ffn_word_offset
+                                                 publish_word(published + (token * hidden + feature) // 2,
+                                                              acc[j * 2].to(fx.BFloat16),
+                                                              acc[j * 2 + 1].to(fx.BFloat16), ffn_epoch)
+@@ -381,7 +448,14 @@
+                                                              value.to(fx.BFloat16))
+                             if fx.const_expr(ffn_peer_mode):
+                                 # Qualification-only fault: omit one CTA from the FFN publication barrier.
+-                                if bid != drop_ffn_cta:
++                                if fx.const_expr(double_mode):
++                                    # The injection omits a producer's packed stores while
++                                    # retaining its reader, so missing data triggers timeout.
++                                    ll_sum(out, ffn_peers, ffn_epoch, ffn_scale, has_ffn_scale,
++                                           fault, tid, bid, rows, hidden, blocks, max_spins,
++                                           tp, rank, 60, ffn_word_offset, DB_DATA)
++                                    advance_sequence(fx.generic_load(ffn_peers + rank), ffn_sequence, tid, bid)
++                                elif bid != drop_ffn_cta:
+                                     if fx.const_expr(ll_mode):
+                                         ll_reduce(out, ffn_peers, ffn_epoch, ffn_scale, has_ffn_scale,
+                                                   control, fault, lds.ok.ptr, tid, bid, rows,
+--- /dev/null
++++ b/specialized_decode/mono/_ll_double_kernel.py
+@@ -0,0 +1,43 @@
++"""Owner-local state for two LL banks. No peer DONE or credit publication.
++
++Every CTA snapshots its own counter before using it. Counter advancement is
++not a completion signal: the next call may read it only in a later kernel on
++the same stream, after ALL blocks of this kernel have completed.
++"""
++import flydsl.expr as fx
++from flydsl.compiler.ast_rewriter import ASTRewriter
++
++from .peer_layout import DB_SEQUENCE, DB_CYCLE
++
++
++def sequence_ptr(base, bid):
++    return fx.inttoptr(fx.PointerType.get(fx.Uint64.ir_type, fx.AddressSpace.Global, 8),
++                      base + fx.Uint64(DB_SEQUENCE)) + bid
++
++
++@ASTRewriter.transform
++def snapshot_sequence(own, slot, tid, bid):
++    if tid == 0:
++        value = fx.generic_load(sequence_ptr(own, bid), memory_order=fx.AtomicOrdering.Acquire,
++                                syncscope="agent")
++        fx.ptr_store(value, slot)
++    fx.gpu.barrier()
++    return fx.ptr_load(slot)
++
++
++def sequence_tag(sequence):
++    return (sequence >> 1).to(fx.Uint32) + fx.Uint32(1)
++
++
++def sequence_offset(sequence, hidden):
++    return (sequence & fx.Uint64(1)).to(fx.Int32) * (16 * hidden // 2)
++
++
++@ASTRewriter.transform
++def advance_sequence(own, sequence, tid, bid):
++    if tid == 0:
++        following = sequence + fx.Uint64(1)
++        if following == fx.Uint64(DB_CYCLE):
++            following = fx.Uint64(0)
++        fx.generic_store(sequence_ptr(own, bid), following,
++                         memory_order=fx.AtomicOrdering.Release, syncscope="agent")
+--- a/specialized_decode/mono/_ll_kernel.py
++++ b/specialized_decode/mono/_ll_kernel.py
+@@ -13,9 +13,9 @@
+ from .peer_layout import DATA, FAILED
+ 
+ 
+-def ll_ptr(base):
++def ll_ptr(base, data_offset=DATA):
+     return fx.inttoptr(fx.PointerType.get(fx.Uint64.ir_type, fx.AddressSpace.Global, 8),
+-                      base + fx.Uint64(DATA))
++                      base + fx.Uint64(data_offset))
+ 
+ 
+ def pack_word(first, second, epoch):
+@@ -37,13 +37,13 @@
+ 
+ 
+ @ASTRewriter.transform
+-def read_word(remote, own, index, epoch, fault, max_spins, site):
++def read_word(remote, own, index, epoch, fault, max_spins, site, word_offset=0, data_offset=DATA):
+     word = fx.Uint64(0)
+     waiting = fx.Int32(1)
+     spins = fx.Int32(0)
+     failed = fx.Uint32(0)
+     while (waiting != 0) & (spins < max_spins) & (failed == 0):
+-        word = acquire(ll_ptr(remote) + index)
++        word = acquire(ll_ptr(remote, data_offset) + word_offset + index)
+         waiting = fx.Int32((word >> 32).to(fx.Uint32) != epoch)
+         failed = acquire(flag_ptr(remote, FAILED)) | fx.generic_load(
+             fault, memory_order=fx.AtomicOrdering.Acquire, syncscope="agent")
+--- a/specialized_decode/mono/a16w16.py
++++ b/specialized_decode/mono/a16w16.py
+@@ -67,8 +67,8 @@
+ 
+ def build_ffn(hidden, intermediate, cache_dir=None, *, blocks=64, tp=1, rank=0,
+               attention_partial=False, ffn_reduce=False, ipc_protocol="simple"):
+-    if ipc_protocol not in ("simple", "ll"):
+-        raise ValueError("ipc_protocol must be simple or ll")
++    if ipc_protocol not in ("simple", "ll", "ll_double"):
++        raise ValueError("ipc_protocol must be simple, ll or ll_double")
+     if tp not in (1, 2, 4) or not 0 <= rank < tp:
+         raise ValueError("Invalid TP size/rank")
+     if any(d <= 0 or d % 16 for d in (hidden, intermediate)) or not 1 <= blocks <= 64:
+--- a/specialized_decode/mono/ll_probe.py
++++ b/specialized_decode/mono/ll_probe.py
+@@ -16,22 +16,27 @@
+             rows, max_spins, salt, fx.Stream(stream))
+ 
+ 
+-def build_probe(hidden, blocks, tp, rank):
++def build_probe(hidden, blocks, tp, rank, ipc_protocol="ll"):
+     _select_target(None)
++    if ipc_protocol not in ("ll", "ll_double"):
++        raise ValueError("Probe requires an LL protocol")
++    double_mode = ipc_protocol == "ll_double"
+     if tp not in (2, 4) or not 0 <= rank < tp or hidden <= 0 or hidden % 16 or not 1 <= blocks <= 64:
+         raise ValueError("Invalid LL probe specialization")
+     import flydsl.compiler as flyc
+     import flydsl.expr as fx
+-    from ._flydsl_kernel import ll_prepare, ll_retire
++    from ._flydsl_kernel import ll_prepare, ll_retire, db_prepare
++    from ._ll_double_kernel import sequence_tag, sequence_offset, advance_sequence
+     from ._ll_kernel import ll_ptr, publish_word, read_word
+     from ._peer_kernel import mark_fault, release, flag_ptr
+-    from .peer_layout import FAILED
++    from .peer_layout import FAILED, DATA, DB_DATA
+ 
+     @fx.struct
+     class Lds:
+         ok: fx.Array[fx.Int32, 1, 4]
++        sequence: fx.Array[fx.Uint64, 1, 8]
+ 
+-    @flyc.kernel(name=f"qwen_ll_probe_v1_h{hidden}_b{blocks}_tp{tp}r{rank}",
++    @flyc.kernel(name=f"qwen_ll_probe_v2_h{hidden}_b{blocks}_tp{tp}r{rank}_p{ipc_protocol}",
+                  known_block_size=[128, 1, 1])
+     def probe(peers: fx.Pointer, control: fx.Pointer, fault: fx.Pointer,
+               rows: fx.Int32, max_spins: fx.Int32, salt: fx.Int32):
+@@ -45,8 +50,17 @@
+             fx.gpu.barrier()
+             if fx.ptr_load(lds.ok.ptr) != 0:
+                 own = fx.generic_load(peers + rank)
+-                epoch = ll_prepare(peers, control, fault, lds.ok.ptr, tid, bid, hidden,
+-                                   blocks, max_spins, tp, rank, 70)
++                sequence = fx.Uint64(0)
++                offset = fx.Int32(0)
++                epoch = fx.Uint32(0)
++                if fx.const_expr(double_mode):
++                    sequence = db_prepare(peers, lds.sequence.ptr, control, fault, lds.ok.ptr,
++                                          tid, bid, hidden, blocks, max_spins, tp, rank, 70)
++                    offset = sequence_offset(sequence, hidden)
++                    epoch = sequence_tag(sequence)
++                else:
++                    epoch = ll_prepare(peers, control, fault, lds.ok.ptr, tid, bid, hidden,
++                                       blocks, max_spins, tp, rank, 70)
+                 if fx.ptr_load(lds.ok.ptr) != 0:
+                     for index in range(bid * 128 + tid, rows * hidden // 2, blocks * 128):
+                         bits = (fx.Int32(index).to(fx.Uint32) * fx.Uint32(0x9E3779B9)
+@@ -54,11 +68,12 @@
+                                 ^ epoch * fx.Uint32(0xC2B2AE35) ^ fx.Uint32(rank * 0x27D4EB2F))
+                         first = bits.to(fx.Uint16).bitcast(fx.BFloat16)
+                         second = (bits >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+-                        publish_word(ll_ptr(own) + index, first, second, epoch)
++                        publish_word(ll_ptr(own, DB_DATA if double_mode else DATA) + offset + index, first, second, epoch)
+                     for index in range(bid * 128 + tid, rows * hidden // 2, blocks * 128):
+                         for peer in fx.range_constexpr(tp):
+                             remote = fx.generic_load(peers + peer)
+-                            observed = read_word(remote, own, index, epoch, fault, max_spins, 70)
++                            observed = read_word(remote, own, index, epoch, fault, max_spins, 70,
++                                                 offset, DB_DATA if double_mode else DATA)
+                             bits = (fx.Int32(index).to(fx.Uint32) * fx.Uint32(0x9E3779B9)
+                                     ^ salt.to(fx.Uint32) * fx.Uint32(0x85EBCA6B)
+                                     ^ epoch * fx.Uint32(0xC2B2AE35) ^ fx.Uint32(peer * 0x27D4EB2F))
+@@ -67,8 +82,11 @@
+                             if observed != expected:
+                                 mark_fault(fault, 71, epoch)
+                                 release(flag_ptr(own, FAILED), fx.Uint32(1))
+-                    ll_retire(peers, epoch, control, fault, lds.ok.ptr, tid, bid, blocks,
+-                              max_spins, tp, rank, 70)
++                    if fx.const_expr(double_mode):
++                        advance_sequence(own, sequence, tid, bid)
++                    else:
++                        ll_retire(peers, epoch, control, fault, lds.ok.ptr, tid, bid, blocks,
++                                  max_spins, tp, rank, 70)
+             if tid == 0:
+                 if fx.generic_load(fault, memory_order=fx.AtomicOrdering.Acquire,
+                                    syncscope="agent") != 0:
+--- a/specialized_decode/mono/peer_layout.py
++++ b/specialized_decode/mono/peer_layout.py
+@@ -1,26 +1,41 @@
+-"""Byte offsets in each dedicated HIP IPC allocation.
++"""HIP IPC layouts. Simple and ll retain one data bank and owner READY/DONE.
+ 
+-Each flag occupies a separate 128-byte region. A single data bank is safe
+-because every owner waits for all read-completion acknowledgements before
+-another launch may overwrite it. Epoch and flags are uint32, device-owned. Simple stores plain BF16; LL stores
+-aligned uint64 payload/tag words. LL reserves zero and scrubs all rows at wrap.
++ll_double reserves 512 bytes for per-CTA owner-only uint64 sequences, followed
++by two packed banks. DONE/EPOCH are unused in that layout; READY is used only
++for rare per-bank rollover scrubs. Headers/payload starts stay eight-byte aligned.
+ """
+ READY = 0
+ DONE = 128
+ EPOCH = 256
+ FAILED = 384
+ DATA = 512
++DB_SEQUENCE = 512  # 64 owner-only uint64 counters, one per CTA.
++DB_DATA = 1024
++DB_MAX_BLOCKS = 64
++DB_TAG_MAX = 0xFFFFFFFF
++DB_CYCLE = 2 * DB_TAG_MAX  # Even: bank alternation survives rollover.
++DB_INITIAL_SEQUENCE = 2  # Fresh zeroed banks do not need a wrap scrub.
++
++
++def double_location(sequence):
++    """Host diagnostic mapping; sequence denotes the next participating call."""
++    if not 0 <= sequence < DB_CYCLE:
++        raise ValueError("Double-buffer sequence is out of range")
++    return sequence & 1, (sequence >> 1) + 1
++
+ 
+ 
+ def protocol_id(protocol="simple"):
+-    if protocol not in ("simple", "ll"):
+-        raise ValueError("IPC protocol must be simple or ll")
+-    return 2 if protocol == "ll" else 1
++    if protocol not in ("simple", "ll", "ll_double"):
++        raise ValueError("IPC protocol must be simple, ll or ll_double")
++    return {"simple": 1, "ll": 2, "ll_double": 3}[protocol]
+ 
+ 
+ def arena_bytes(hidden, max_rows=16, protocol="simple"):
+     protocol_id(protocol)
+     if hidden <= 0 or hidden % 2 or not 1 <= max_rows <= 16:
+         raise ValueError("Expected even hidden size and 1..16 rows")
++    if protocol == "ll_double":
++        return DB_DATA + 2 * max_rows * hidden * 4
+     # LL: two BF16 values + uint32 epoch in each aligned uint64 word.
+     return DATA + max_rows * hidden * (4 if protocol == "ll" else 2)
+--- a/specialized_decode/runtime/peer.py
++++ b/specialized_decode/runtime/peer.py
+@@ -15,7 +15,8 @@
+ 
+ from ._hip_ipc import HipRuntime, ipc_export_diagnostic
+ from ..mono.peer_layout import arena_bytes, protocol_id
+-from ..mono.peer_layout import READY, DONE, EPOCH
++from ..mono.peer_layout import (READY, DONE, EPOCH, DB_SEQUENCE, DB_DATA,
++                                DB_MAX_BLOCKS, DB_INITIAL_SEQUENCE, DB_CYCLE)
+ 
+ 
+ def validate_topology(records, tp, size, purpose="attention", protocol="simple"):
+@@ -55,6 +56,7 @@
+         if config.tp_size not in (2, 4):
+             raise ValueError("PeerArena requires TP2 or TP4")
+         self.protocol = config.ipc_protocol
++        self.blocks = getattr(config, "blocks", 64)
+         self.size = arena_bytes(config.hidden_size, protocol=self.protocol)
+         record = {"purpose": purpose, "rank": config.tp_rank, "size": self.size, "protocol": protocol_id(self.protocol), "error": None,
+                   "ipc_mode": os.environ.get("HSA_ENABLE_IPC_MODE_LEGACY", "<unset>")}
+@@ -89,6 +91,9 @@
+             self.own = allocate(self.size)
+             if self.own % 8:
+                 raise RuntimeError("IPC base must be aligned to 8 bytes")
++            if self.protocol == "ll_double":
++                phase = "double-buffer sequence initialization"
++                self._write_sequences(DB_INITIAL_SEQUENCE)
+             torch.cuda.synchronize(self.device)
+             phase = "IPC handle export"
+             try:
+@@ -180,12 +185,73 @@
+         self.table = None
+         self.closed = True
+ 
++    def _write_sequences(self, sequence):
++        lib = self.runtime.library()
++        lib.hipMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
++        lib.hipMemcpy.restype = ctypes.c_int
++        counters = (ctypes.c_uint64 * DB_MAX_BLOCKS)(*([sequence] * DB_MAX_BLOCKS))
++        self.runtime.check(lib.hipMemcpy(self.own + DB_SEQUENCE, counters, ctypes.sizeof(counters), 1),
++                           operation="double-buffer sequence initialization H2D")
++
++    def debug_seed_sequence_collective(self, sequence, *, payload_epoch=None):
++        """Qualification only: all ranks quiescent, no live/replaying graphs.
++
++        Seed the NEXT call's per-CTA sequence. Optionally poison both payload
++        banks with stale tags; the device rollover must scrub each bank only
++        when it is safe to reuse. Never clears sticky faults.
++        """
++        if self.protocol != "ll_double" or not 0 <= sequence < DB_CYCLE:
++            raise ValueError("Expected ll_double and a sequence in [0, DB_CYCLE)")
++        if payload_epoch is not None and not 0 <= payload_epoch < 2**32:
++            raise ValueError("Expected uint32 payload tag")
++        with torch.cuda.device(self.device):
++            torch.cuda.synchronize(self.device)
++            seeds = self.collective.gather_host((sequence, payload_epoch))
++            if any(v != (sequence, payload_epoch) for v in seeds):
++                raise RuntimeError("Sequence seed must agree on every TP rank")
++            self._write_sequences(sequence)
++            lib = self.runtime.library()
++            zero = ctypes.c_uint32(0)
++            self.runtime.check(lib.hipMemcpy(self.own + READY, ctypes.byref(zero), 4, 1),
++                               operation="qualification wrap-generation initialization")
++            if payload_epoch is not None:
++                count = (self.size - DB_DATA) // 8
++                payload = (ctypes.c_uint64 * count)(*([payload_epoch << 32] * count))
++                self.runtime.check(lib.hipMemcpy(self.own + DB_DATA, payload, count * 8, 1),
++                                   operation="qualification double-buffer stale-tag seeding")
++            torch.cuda.synchronize(self.device)
++            self.collective.gather_host(None)
++
++    def debug_sequence(self):
++        """Read/check active CTA counters after kernel completion, never hot path."""
++        if self.protocol != "ll_double":
++            raise ValueError("Sequence diagnostics require ll_double")
++        with torch.cuda.device(self.device):
++            torch.cuda.synchronize(self.device)
++            lib = self.runtime.library()
++            lib.hipMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
++            lib.hipMemcpy.restype = ctypes.c_int
++            counters = (ctypes.c_uint64 * self.blocks)()
++            self.runtime.check(lib.hipMemcpy(counters, self.own + DB_SEQUENCE, ctypes.sizeof(counters), 2),
++                               operation="qualification sequence D2H")
++            values = list(counters)
++            if len(set(values)) != 1 or not 0 <= values[0] < DB_CYCLE:
++                raise RuntimeError(f"Double-buffer CTA sequence disagreement: {values}")
++            done = ctypes.c_uint32()
++            self.runtime.check(lib.hipMemcpy(ctypes.byref(done), self.own + DONE, 4, 2),
++                               operation="qualification unused DONE check")
++            if done.value != 0:
++                raise RuntimeError("ll_double unexpectedly published DONE")
++            return values[0]
++
+     def debug_seed_epoch_collective(self, epoch, *, payload_epoch=None):
+         """Qualification only: all ranks quiescent, no live/replaying graphs.
+ 
+         Seed READY/DONE and EPOCH together to test uint32 rollover. This does
+         not reset fault state and must never be used to recover a failed run.
+         """
++        if self.protocol == "ll_double":
++            raise ValueError("Use debug_seed_sequence_collective for ll_double")
+         if not 0 <= epoch < 2**32:
+             raise ValueError("Expected uint32 epoch")
+         if payload_epoch is not None and (self.protocol != "ll" or not 0 <= payload_epoch < 2**32):
+@@ -213,6 +279,8 @@
+ 
+     def debug_epoch(self):
+         """Qualification only; blocks the host until device work completes."""
++        if self.protocol == "ll_double":
++            raise ValueError("Use debug_sequence for ll_double")
+         with torch.cuda.device(self.device):
+             torch.cuda.synchronize(self.device)
+             lib = self.runtime.library()
+--- a/specialized_decode/runtime/spec.py
++++ b/specialized_decode/runtime/spec.py
+@@ -49,12 +49,14 @@
+     @property
+     def grid_barriers_per_launch(self):
+         """Normal-path count; LL adds two per arena on rare epoch rollover."""
++        if self.ipc_protocol == "ll_double":
++            return 2 + int(self.fused_attention_reduce)
+         per_reduce = 2 if self.ipc_protocol == "ll" else 4
+         return 2 + per_reduce * (int(self.fused_attention_reduce) + int(self.fused_ffn_reduce))
+ 
+     def __post_init__(self):
+-        if self.ipc_protocol not in ("simple", "ll"):
+-            raise ValueError("ipc_protocol must be simple or ll")
++        if self.ipc_protocol not in ("simple", "ll", "ll_double"):
++            raise ValueError("ipc_protocol must be simple, ll or ll_double")
+         if self.ffn_reduction not in ("collective", "ipc"):
+             raise ValueError("ffn_reduction must be collective or ipc")
+         if self.attention_input not in ("reduced", "partial"):
+--- /dev/null
++++ b/tests/test_ll_double.py
+@@ -0,0 +1,171 @@
++"""Host configuration and exhaustive finite double-buffer protocol models.
++
++Models assume coherent atomic words and one kernel at a time per workspace.
++They do not validate GPU memory ordering. Negative variants must exhibit an
++overwrite or stale-tag error, so the model is not merely a happy-path trace.
++"""
++from dataclasses import replace
++import ctypes
++import struct
++from types import SimpleNamespace
++import unittest
++from unittest.mock import Mock
++
++from specialized_decode.mono.peer_layout import (
++    DB_SEQUENCE, DB_DATA, DB_MAX_BLOCKS, DB_CYCLE, DB_INITIAL_SEQUENCE,
++    arena_bytes, double_location, protocol_id,
++)
++from specialized_decode.runtime.parallel import setup_signature, _check_agreement
++from specialized_decode.runtime.peer import PeerArena, validate_topology
++from specialized_decode.runtime.spec import DecodeConfig
++
++
++def explore(tp, active, *, banks=2, scrub=True, scrub_both=False):
++    # Tiny two-tag cycle forces real reuse and rollover within eight calls.
++    rounds = len(active)
++    def location(step):
++        seq = (2 + step) % 4
++        return step % banks, seq // 2 + 1, seq < 2
++
++    def entry(step):
++        if step == rounds:
++            return (step, 2, 0, 0)
++        return (step, 0 if location(step)[2] and scrub else 2,
++                0, 0 if active[step] == 2 else 2)
++
++    def visible(rank_state, bank, word):
++        step, phase, p0, p1 = rank_state
++        last_write, last_clear = -1, -1
++        for previous in range(min(step + 1, rounds)):
++            b, tag, wrap = location(previous)
++            entered = previous < step or phase >= 1
++            if scrub and wrap and entered and (b == bank or scrub_both):
++                last_clear = previous
++            if b != bank:
++                continue
++            published = previous < step or (phase == 2 and (p0, p1)[word] >= 1)
++            if word < active[previous] and published:
++                last_write = previous
++        if last_write < 0 or last_write < last_clear:
++            return 0, None
++        return location(last_write)[1], last_write
++
++    initial = tuple(entry(0) for _ in range(tp))
++    stack, seen, completed, reuses = [initial], set(), 0, 0
++    while stack:
++        state = stack.pop()
++        if state in seen:
++            continue
++        seen.add(state)
++        if all(s[0] == rounds for s in state):
++            completed += 1
++            continue
++        choices = []
++        for rank, (step, phase, p0, p1) in enumerate(state):
++            if step == rounds:
++                continue
++            bank, expected, _ = location(step)
++            if phase == 0:
++                if step >= banks:
++                    assert all(s[0] > step - banks for s in state), ("overwrite during scrub", state)
++                if scrub_both and step >= 1:
++                    assert all(s[0] >= step for s in state), ("overwrite other bank", state)
++                choices.append((rank, (step, 1, p0, p1)))
++            elif phase == 1:
++                if all(s[0] > step or (s[0] == step and s[1] >= 1) for s in state):
++                    choices.append((rank, (step, 2, p0, p1)))
++            else:
++                for word, status in enumerate((p0, p1)):
++                    if word >= active[step] or status == 2:
++                        continue
++                    if status == 0:
++                        if step >= banks:
++                            assert all(s[0] > step - banks for s in state), ("overwrite", state)
++                            reuses += 1
++                    else:
++                        payloads = [visible(s, bank, word) for s in state]
++                        if not all(tag == expected for tag, _ in payloads):
++                            continue
++                        assert all(source == step for _, source in payloads), ("stale tag", state)
++                    nxt = list(state[rank]); nxt[word + 2] += 1
++                    choices.append((rank, tuple(nxt)))
++                if p0 == p1 == 2:
++                    # Whole local kernel completion, not an independently
++                    # advancing CTA or a host enqueue, permits the next call.
++                    choices.append((rank, entry(step + 1)))
++        assert choices, ("deadlock", state)
++        for rank, nxt in choices:
++            new = list(state); new[rank] = nxt; stack.append(tuple(new))
++    assert completed == 1
++    return len(seen), reuses
++
++
++class DoubleBufferTests(unittest.TestCase):
++    def test_host_initialization_sets_every_cta_counter_without_touching_banks(self):
++        transfers = []
++        memcpy = Mock(side_effect=lambda dst, src, size, kind:
++                      transfers.append((dst, ctypes.string_at(src, size), kind)) or 0)
++        runtime = SimpleNamespace(library=lambda: SimpleNamespace(hipMemcpy=memcpy),
++                                  check=lambda status, **kw: self.assertEqual(status, 0))
++        arena = object.__new__(PeerArena)
++        arena.runtime, arena.own = runtime, 0x100000
++        arena._write_sequences(DB_INITIAL_SEQUENCE)
++        self.assertEqual(transfers, [(0x100000 + DB_SEQUENCE,
++                                     struct.pack("<64Q", *([2] * 64)), 1)])
++
++    def test_layout_counters_and_banks_are_disjoint(self):
++        self.assertEqual(DB_SEQUENCE + DB_MAX_BLOCKS * 8, DB_DATA)
++        self.assertEqual(DB_DATA % 8, 0)
++        self.assertEqual(arena_bytes(5120, protocol="ll_double"), 656384)
++        self.assertEqual(protocol_id("ll_double"), 3)
++        self.assertEqual(double_location(DB_INITIAL_SEQUENCE), (0, 2))
++        self.assertEqual([double_location(s) for s in (DB_CYCLE-2, DB_CYCLE-1, 0, 1, 2)],
++                         [(0, 0xFFFFFFFF), (1, 0xFFFFFFFF), (0, 1), (1, 1), (0, 2)])
++        for invalid in (-1, DB_CYCLE):
++            with self.assertRaises(ValueError):
++                double_location(invalid)
++
++    def test_protocol_and_rank_agreement(self):
++        size = arena_bytes(32, protocol="ll_double")
++        records = [dict(rank=r, error=None, protocol=3, size=size, host=("node", "boot"),
++                        bus=str(r), handle=bytes(64)) for r in range(2)]
++        validate_topology(records, 2, size, protocol="ll_double")
++        records[1]["protocol"] = 2
++        with self.assertRaisesRegex(RuntimeError, "layout"):
++            validate_topology(records, 2, size, protocol="ll_double")
++        c = DecodeConfig(tp_size=2, ipc_protocol="ll_double")
++        records = [dict(rank=r, error=None, signature=setup_signature(cfg)) for r, cfg in
++                   enumerate((c, replace(c, ipc_protocol="ll")))]
++        with self.assertRaisesRegex(RuntimeError, "disagree"):
++            _check_agreement(records, 2)
++
++    def test_only_local_compute_barriers_remain(self):
++        for tp in (1, 2, 4):
++            for attention in ("reduced", "partial"):
++                for ffn in ("collective", "ipc"):
++                    c = DecodeConfig(tp_size=tp, ipc_protocol="ll_double",
++                                     attention_input=attention, ffn_reduction=ffn)
++                    self.assertEqual(c.grid_barriers_per_launch,
++                                     2 + int(tp > 1 and attention == "partial"))
++
++    def test_all_interleavings_variable_rows_reuse_and_two_rollovers(self):
++        for tp in (2, 4):
++            states, reuses = explore(tp, (2, 2, 2, 2, 1, 1, 2, 2))
++            self.assertGreater(states, 100)
++            self.assertGreater(reuses, 0)
++
++    def test_one_bank_without_done_is_unsafe(self):
++        with self.assertRaisesRegex(AssertionError, "overwrite"):
++            explore(2, (2, 2, 2), banks=1)
++
++    def test_omitting_full_bank_rollover_scrub_is_unsafe(self):
++        with self.assertRaisesRegex(AssertionError, "stale tag"):
++            explore(2, (2, 2, 2, 2, 1, 1, 2, 2), scrub=False)
++
++    def test_scrubbing_both_banks_together_is_unsafe(self):
++        with self.assertRaisesRegex(AssertionError, "other bank"):
++            explore(2, (2, 2, 2, 2), scrub_both=True)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/validate_tp.py
++++ b/validate_tp.py
+@@ -17,12 +17,14 @@
+ import json
+ import math
+ import os
++import time
+ 
+ import torch
+ import torch.distributed as dist
+ 
+ from specialized_decode.mono.ffn import reference_ffn, attention_sum_reference
+ from specialized_decode.mono.runner import FfnRunner
++from specialized_decode.mono.peer_layout import DB_CYCLE
+ from specialized_decode.runtime.parallel import TorchTpCollective, setup_signature
+ from specialized_decode.runtime.spec import DecodeConfig
+ from specialized_decode.runtime.weights import LayerWeights, shard_reference_weights
+@@ -93,7 +95,7 @@
+         from specialized_decode.mono.residency import checked_residency
+         error = None
+         try:
+-            probe = build_probe(h, args.blocks, tp, rank)
++            probe = build_probe(h, args.blocks, tp, rank, args.ipc_protocol)
+             checked_residency(probe, args.blocks, torch.cuda.get_device_properties(device))
+             probe(*probe_arguments(stream=stream.cuda_stream))
+         except Exception as exc:
+@@ -102,8 +104,19 @@
+         if errors:
+             raise RuntimeError("; ".join(errors))
+     def advanced_epoch(seed, steps):
++        if args.ipc_protocol == "ll_double":
++            return (seed + steps) % DB_CYCLE
+         modulus = 0xFFFFFFFF if args.ipc_protocol == "ll" else 0x100000000
+         return ((seed + steps - 1) % modulus) + 1 if args.ipc_protocol == "ll" else (seed + steps) % modulus
++
++    def arena_counter(arena):
++        return arena.debug_sequence() if args.ipc_protocol == "ll_double" else arena.debug_epoch()
++
++    def seed_arena(arena, seed, *, payload_epoch=None):
++        if args.ipc_protocol == "ll_double":
++            arena.debug_seed_sequence_collective(seed, payload_epoch=payload_epoch)
++        else:
++            arena.debug_seed_epoch_collective(seed, payload_epoch=payload_epoch)
+ 
+     records = []
+     scale = rand((1, 1, h), .125) if args.attention_scale else None
+@@ -145,7 +158,16 @@
+             for name, arena in (("attention", runner.peer_arena), ("ffn", runner.ffn_peer_arena)):
+                 if arena is None:
+                     continue
++                before = arena_counter(arena)
+                 for iteration in range(args.ll_stress):
++                    # Zero-row warmups must not consume a bank/sequence. All
++                    # ranks skip identically; no host step counters are used.
++                    if iteration % 11 == 0:
++                        probe(*probe_arguments(arena.table.data_ptr(), runner.control.data_ptr(),
++                                               runner.fault_word.data_ptr(), 0, config.max_spins,
++                                               iteration, stream.cuda_stream))
++                    if args.ll_skew_ms and rank == iteration % tp:
++                        time.sleep(args.ll_skew_ms / 1000)
+                     rows = (16, 1, 7, 2, 15, 3)[iteration % 6]
+                     probe(*probe_arguments(arena.table.data_ptr(), runner.control.data_ptr(),
+                                            runner.fault_word.data_ptr(), rows, config.max_spins,
+@@ -153,20 +175,29 @@
+                 stream.synchronize()
+                 if runner.health()[0]:
+                     raise AssertionError(f"LL {name} bit-pattern stress failed: {runner.health()}")
+-                # Force stale one tags at wrap, and stale two tags in rows
+-                # inactive during wrap. Zero is reserved; wrap resumes at one.
+-                for old_tag, schedule in ((1, (1, 16)), (2, (1, 1, 16))):
+-                    arena.debug_seed_epoch_collective(0xFFFFFFFE, payload_epoch=old_tag)
++                if arena_counter(arena) != advanced_epoch(before, args.ll_stress):
++                    raise AssertionError("Active/zero-row calls advanced the sequence incorrectly")
++                # Poison both banks for ll_double; check active and inactive
++                # rows at each bank's wrap and its subsequent reuse.
++                cases = (((1, (1, 1, 16, 16)), (2, (1, 1, 1, 1, 16, 16)))
++                         if args.ipc_protocol == "ll_double" else
++                         ((1, (1, 16)), (2, (1, 1, 16))))
++                seed = DB_CYCLE - 2 if args.ipc_protocol == "ll_double" else 0xFFFFFFFE
++                for old_tag, schedule in cases:
++                    seed_arena(arena, seed, payload_epoch=old_tag)
+                     for iteration, rows in enumerate(schedule):
++                        if args.ll_skew_ms and rank == (iteration + 1) % tp:
++                            time.sleep(args.ll_skew_ms / 1000)
+                         probe(*probe_arguments(arena.table.data_ptr(), runner.control.data_ptr(),
+                                                runner.fault_word.data_ptr(), rows, config.max_spins,
+                                                iteration + args.ll_stress, stream.cuda_stream))
+                     stream.synchronize()
+-                    expected_epoch = advanced_epoch(0xFFFFFFFE, len(schedule))
+-                    if runner.health()[0] or arena.debug_epoch() != expected_epoch:
++                    expected_epoch = advanced_epoch(seed, len(schedule))
++                    if runner.health()[0] or arena_counter(arena) != expected_epoch:
+                         raise AssertionError(f"LL {name} wrap stress failed: {runner.health()}")
+                 records.append({"test": f"ll-{name}-bit-pattern-and-wrap-stress",
+-                                "launches": args.ll_stress + 5, "passed": True})
++                                "active_launches": args.ll_stress + sum(len(plan) for _, plan in cases),
++                                "zero_row_calls": (args.ll_stress + 10) // 11, "passed": True})
+         for rows in (1, 2, 3, 4, 7, 8, 15, 16):
+             a, residual = local_attention(rows), rand((rows, h))
+             attention = reduced_attention(a)
+@@ -205,18 +236,20 @@
+                 raise AssertionError("Device generation did not wrap")
+             compare("generation-wrap", actual, expected_tp)
+             # Different seeds catch accidental aliasing between the two mailboxes.
+-            arenas = [("attention", runner.peer_arena, 0xFFFFFFFE),
+-                      ("ffn", runner.ffn_peer_arena, 0xFFFFFFFD)]
++            seeds = ((DB_CYCLE - 2, DB_CYCLE - 3) if args.ipc_protocol == "ll_double" else
++                     (0xFFFFFFFE, 0xFFFFFFFD))
++            arenas = [("attention", runner.peer_arena, seeds[0]),
++                      ("ffn", runner.ffn_peer_arena, seeds[1])]
+             for name, arena, seed in arenas:
+                 if arena is not None:
+-                    arena.debug_seed_epoch_collective(seed)
++                    seed_arena(arena, seed)
+             for step in range(1, 5):
+                 actual, _ = runner.launch_layer(local, a, residual, attention_scale=scale,
+                                                 ffn_scale=ffn_scale)
+                 runner.check_health()
+                 stream.synchronize()
+                 for name, arena, seed in arenas:
+-                    if arena is not None and arena.debug_epoch() != advanced_epoch(seed, step):
++                    if arena is not None and arena_counter(arena) != advanced_epoch(seed, step):
+                         raise AssertionError(f"{name} peer epoch did not advance/wrap independently")
+                 compare(f"peer-wrap/{step}", actual, expected_tp)
+ 
+@@ -268,7 +301,7 @@
+                 first = bad.health()
+                 expected_site = 20 if stage == "ffn" else (3 if config.fused_attention_reduce else 1)
+                 sites = {expected_site}
+-                if config.ipc_protocol == "ll":
++                if config.ipc_protocol in ("ll", "ll_double"):
+                     sites = ({60, 62, 64} if stage == "ffn" else
+                              ({50, 52, 54} if config.fused_attention_reduce else {1}))
+                 if first[0] != 1 or (not args.cpu and rank == 0 and first[1] not in sites):
+@@ -284,7 +317,7 @@
+               "group": group_id, "backend": config.backend, "collective": backend,
+               "attention_input": config.attention_input, "attention_scale": args.attention_scale,
+               "ffn_reduction": config.ffn_reduction, "ffn_scale": args.ffn_scale,
+-              "ipc_protocol": config.ipc_protocol, "ll_stress": args.ll_stress,
++              "ipc_protocol": config.ipc_protocol, "ll_stress": args.ll_stress, "ll_skew_ms": args.ll_skew_ms,
+               "local_w13": list(local.w13.shape), "local_w2": list(local.w2.shape),
+               "checks_passed": len(records), "measurements": records}
+     if args.report_dir:
+@@ -303,8 +336,9 @@
+     parser.add_argument("--attention-scale", action="store_true")
+     parser.add_argument("--ffn-reduction", choices=("collective", "ipc"), default="collective")
+     parser.add_argument("--ffn-scale", action="store_true")
+-    parser.add_argument("--ipc-protocol", choices=("simple", "ll"), default="simple")
++    parser.add_argument("--ipc-protocol", choices=("simple", "ll", "ll_double"), default="simple")
+     parser.add_argument("--ll-stress", type=int, default=0, help="GPU bit-pattern transport iterations per LL arena")
++    parser.add_argument("--ll-skew-ms", type=float, default=0, help="Alternate which rank delays stress launches")
+     parser.add_argument("--small", action="store_true")
+     parser.add_argument("--graph", action="store_true")
+     parser.add_argument("--fault-test", action="store_true")
+@@ -321,9 +355,11 @@
+         parser.error("--ffn-scale requires --ffn-reduction ipc")
+     if args.ll_stress < 0 or args.ll_stress >= 2**31:
+         parser.error("--ll-stress must be in [0, 2**31)")
+-    if args.ll_stress and (args.cpu or args.ipc_protocol != "ll" or
++    if args.ll_stress and (args.cpu or args.ipc_protocol not in ("ll", "ll_double") or
+                            not (args.attention_partials or args.ffn_reduction == "ipc")):
+-        parser.error("--ll-stress requires GPU --ipc-protocol ll and at least one fused reduction")
++        parser.error("--ll-stress requires a GPU LL protocol and at least one fused reduction")
++    if not math.isfinite(args.ll_skew_ms) or args.ll_skew_ms < 0 or (args.ll_skew_ms and not args.ll_stress):
++        parser.error("--ll-skew-ms must be finite, nonnegative, and requires --ll-stress")
+     try:
+         run(args)
+     finally:
